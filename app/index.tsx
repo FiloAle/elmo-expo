@@ -164,8 +164,10 @@ export default function App() {
 	const [inputText, setInputText] = useState("");
 	const [isProcessing, setIsProcessing] = useState(false);
 
-	const [navigationState, setNavigationState] =
-		useState<NavigationState>("idle");
+	const [navigationState, setNavigationState] = useState<
+		"idle" | "preview" | "active"
+	>("idle");
+	const [isPausedAtStop, setIsPausedAtStop] = useState(false);
 	const [shouldAutoStart, setShouldAutoStart] = useState(false);
 
 	// Refs for stale closures
@@ -217,7 +219,6 @@ export default function App() {
 	const [stopsPanelCategory, setStopsPanelCategory] = useState<string | null>(
 		null
 	);
-	const [isPausedAtStop, setIsPausedAtStop] = useState(false);
 	const [stopsSearchResults, setStopsSearchResults] = useState<PlaceResult[]>(
 		[]
 	);
@@ -283,8 +284,25 @@ export default function App() {
 	const distanceTraveled = useRef(0); // Track total distance traveled for progress bar (cumulative for session)
 	const distanceTraveledOnCurrentRoute = useRef(0); // Track distance on current route (resets on reroute)
 	const routeInfoRef = useRef<RouteResult | null>(null);
-	const lastPausedLegIndex = useRef(-1); // Track last leg index where we paused to avoid loops
+	const lastPausedLegIndex = useRef<number>(-1); // Track last leg index where we paused to avoid loops
 	const navigationStartTime = useRef<number | null>(null);
+
+	// Fake Stop Timer Logic Refs
+	const hasTriggeredFakeStopRef = useRef(false);
+	const addedStopsRef = useRef(addedStops);
+	const myStopRequestsRef = useRef(myStopRequests);
+	const pendingStopRequestRef = useRef(pendingStopRequest);
+
+	// Keep refs in sync
+	useEffect(() => {
+		addedStopsRef.current = addedStops;
+	}, [addedStops]);
+	useEffect(() => {
+		myStopRequestsRef.current = myStopRequests;
+	}, [myStopRequests]);
+	useEffect(() => {
+		pendingStopRequestRef.current = pendingStopRequest;
+	}, [pendingStopRequest]);
 
 	// Voice Guidance State
 	// Format: "lat,lng_distanceStage" -> e.g., "45.5,9.1_250"
@@ -405,19 +423,25 @@ export default function App() {
 					}
 
 					// 2. Update Speed (Physics)
-					const currentSpeed = autopilotSpeed.current;
-					if (currentSpeed < targetSpeed) {
-						// Accelerate (2 m/s^2)
-						autopilotSpeed.current = Math.min(
-							targetSpeed,
-							currentSpeed + 2 * dt
-						);
+					// Prevent acceleration if we are essentially arrived
+					if (autopilotIndex.current >= routeCoords.length - 1) {
+						autopilotSpeed.current = 0;
+						setSpeed(0); // explicitly force React state update
 					} else {
-						// Decelerate (4 m/s^2)
-						autopilotSpeed.current = Math.max(
-							targetSpeed,
-							currentSpeed - 4 * dt
-						);
+						const currentSpeed = autopilotSpeed.current;
+						if (currentSpeed < targetSpeed) {
+							// Accelerate (2 m/s^2)
+							autopilotSpeed.current = Math.min(
+								targetSpeed,
+								currentSpeed + 2 * dt
+							);
+						} else {
+							// Decelerate (4 m/s^2)
+							autopilotSpeed.current = Math.max(
+								targetSpeed,
+								currentSpeed - 4 * dt
+							);
+						}
 					}
 
 					// 3. Move
@@ -458,6 +482,14 @@ export default function App() {
 						if (autopilotIndex.current >= routeCoords.length - 1) {
 							// Arrived
 							setSpeed(0);
+							autopilotSpeed.current = 0;
+
+							// Force exact 100% progress
+							if (routeInfoRef.current) {
+								distanceTraveledOnCurrentRoute.current =
+									routeInfoRef.current.distance;
+							}
+
 							// Force "Arrived" maneuver to keep the panel visible
 							setNextManeuver({
 								type: "arrive",
@@ -575,11 +607,16 @@ export default function App() {
 							currentRouteInfo &&
 							currentLegIndex < currentRouteInfo.legs.length - 1 &&
 							remainingDistInLeg < 50 &&
-							remainingDistInLeg > 0
+							remainingDistInLeg > 0 &&
+							currentLegIndex !== lastPausedLegIndex.current
 						) {
 							const waypointName =
 								routeWaypoints[currentLegIndex]?.name || "stop";
 							speak(`You have arrived at ${waypointName}`, "leg_arrive");
+							setIsPausedAtStop(true);
+							setSpeed(0);
+							autopilotSpeed.current = 0;
+							lastPausedLegIndex.current = currentLegIndex;
 						} else {
 							if (distance < remainingDistInLeg) {
 								// Phrase generation helper
@@ -2000,7 +2037,7 @@ export default function App() {
 					startNavigation();
 					setShouldAutoStart(false); // Reset flag
 				} else {
-					setNavigationState("preview");
+					setNavigationState("idle"); // Changed from "preview" to "idle"
 					// Fit map to route
 					if (mapRef.current && targetLat && targetLng) {
 						mapRef.current.fitToCoordinates(
@@ -2203,14 +2240,14 @@ export default function App() {
 		}
 	}
 
-	// Auto-accept stop request after 5 seconds
+	// Auto-accept stop request after 8 seconds
 	useEffect(() => {
 		if (pendingStopRequest) {
 			const timer = setTimeout(() => {
 				console.log("[App] Auto-accepting stop request");
 				speakText(`A stop at ${pendingStopRequest.name} has been added`);
 				handleStopRequestAccept();
-			}, 5000);
+			}, 8000);
 			return () => clearTimeout(timer);
 		}
 	}, [pendingStopRequest]);
@@ -2388,6 +2425,7 @@ export default function App() {
 		setNavigationState("active");
 		distanceTraveled.current = 0;
 		lastPausedLegIndex.current = -1;
+		hasTriggeredFakeStopRef.current = false;
 		navigationStartTime.current = Date.now();
 		if (userRegion && mapRef.current) {
 			mapRef.current.animateCamera(
@@ -2405,6 +2443,50 @@ export default function App() {
 			);
 		}
 	}
+
+	// Fake Stop Suggestion Timer
+	useEffect(() => {
+		let timer: ReturnType<typeof setTimeout>;
+		if (
+			navigationState === "active" &&
+			deviceRole === "car1-main" &&
+			!hasTriggeredFakeStopRef.current
+		) {
+			console.log("[App] Starting 80s timer for fake stop suggestion");
+			// Mark as triggered immediately to prevent loop if re-render happens
+			hasTriggeredFakeStopRef.current = true;
+
+			timer = setTimeout(() => {
+				// Only suggest if not already pending and not already added
+				// Autogrill Pero Nord
+				const fakeStop = {
+					id: "autogrill-pero-nord",
+					name: "Autogrill Pero Nord",
+					latitude: 45.51385067115633,
+					longitude: 9.069810203049895,
+				};
+
+				// Use refs to check current state without adding dependencies
+				const alreadyPending = pendingStopRequestRef.current;
+				const alreadyAdded = addedStopsRef.current.includes(fakeStop.id);
+				const alreadyRequested = myStopRequestsRef.current.includes(
+					fakeStop.id
+				);
+
+				if (!alreadyPending && !alreadyAdded && !alreadyRequested) {
+					console.log("[App] Triggering fake stop suggestion");
+					setPendingStopRequest(fakeStop);
+					speakText(
+						"The other car is suggesting a stop at Autogrill Pero Nord"
+					);
+				}
+			}, 80000); // 1.3 minutes
+		}
+
+		return () => {
+			if (timer) clearTimeout(timer);
+		};
+	}, [navigationState, deviceRole]);
 
 	function cancelNavigation() {
 		setDestination(null);
@@ -2442,16 +2524,34 @@ export default function App() {
 		}
 	}
 
-	function handleResumeNavigation() {
+	async function handleResumeNavigation() {
 		setIsPausedAtStop(false);
-		// Remove the reached waypoint (first one) if any
-		if (routeWaypoints.length > 0) {
-			setRouteWaypoints((prev) => prev.slice(1));
-		} else if (destination) {
-			// If it was the final destination, maybe just clear it?
-			// But usually "resume" implies continuing.
-			// For now, let's assume if we pause at destination, resuming just keeps us there or ends.
-			// Let's just re-enable autopilot to finish the route.
+
+		// Remove the reached waypoint (first one)
+		const nextWaypoints =
+			routeWaypoints.length > 0 ? routeWaypoints.slice(1) : [];
+		setRouteWaypoints(nextWaypoints);
+
+		// Recalculate route to destination from current location
+		if (userRegion && destination) {
+			const start = {
+				latitude: userRegion.latitude,
+				longitude: userRegion.longitude,
+			};
+			const route = await getRoute(
+				[start.latitude, start.longitude],
+				[destination.latitude, destination.longitude],
+				nextWaypoints.map((wp) => ({
+					coordinates: [wp.latitude, wp.longitude],
+				}))
+			);
+			if (route) {
+				setRouteInfo(route);
+				setRouteCoords(route.coordinates);
+				distanceTraveledOnCurrentRoute.current = 0; // Reset distance for new route
+				setNextManeuver(null); // Reset maneuver until next update
+				lastPausedLegIndex.current = -1; // Reset pause tracker
+			}
 		}
 		// Broadcast resume
 		if (isSyncConnected && deviceRole === "car1-main") {
@@ -2787,8 +2887,9 @@ export default function App() {
 													routeInfo.distance
 														? Math.min(
 																1,
-																distanceTraveledOnCurrentRoute.current /
-																	routeInfo.distance
+																distanceTraveled.current /
+																	(distanceTraveled.current +
+																		routeInfo.distance)
 														  )
 														: 0
 												}
@@ -2799,9 +2900,8 @@ export default function App() {
 																	.slice(0, i + 1)
 																	.reduce((sum, l) => sum + l.distance, 0);
 																return (
-																	(distanceTraveledOnCurrentRoute.current +
-																		distToStop) /
-																	(distanceTraveledOnCurrentRoute.current +
+																	(distanceTraveled.current + distToStop) /
+																	(distanceTraveled.current +
 																		routeInfo.distance)
 																);
 														  })

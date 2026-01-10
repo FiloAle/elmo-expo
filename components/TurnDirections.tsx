@@ -68,8 +68,8 @@ export function TurnDirections({ maneuver }: TurnDirectionsProps) {
 				break;
 			case "arrive":
 				icon = "location";
-				if (distance < 10) {
-					text = "Arrived at \ndestination";
+				if (distance < 50) {
+					text = "Arrived at \nwaypoint";
 				} else {
 					text = `Arriving \nin ${distText}`;
 				}

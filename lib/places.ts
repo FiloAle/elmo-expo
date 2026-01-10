@@ -1,4 +1,5 @@
 export interface PlaceResult {
+	id?: string;
 	name: string;
 	latitude: number;
 	longitude: number;
@@ -33,9 +34,13 @@ const QUERY_MAPPING: Record<string, string> = {
 	library: "[amenity=library]",
 	"post office": "[amenity=post_office]",
 	police: "[amenity=police]",
+	"tourist attraction": "[tourism=attraction]",
+	attraction: "[tourism=attraction]",
+	museum: "[tourism=museum]",
 };
 
 const AUTOGRILL_PERO_NORD = {
+	id: "autogrill-pero-nord",
 	name: "Autogrill Pero Nord, Italy",
 	latitude: 45.51385067115633,
 	longitude: 9.069810203049895,
@@ -70,7 +75,10 @@ export async function searchPlaces(
 			injectedResult = {
 				...AUTOGRILL_PERO_NORD,
 				distance: Math.round(dist),
-				image: generatePlaceImage(AUTOGRILL_PERO_NORD.name, "autogrill restaurant"),
+				image: generatePlaceImage(
+					AUTOGRILL_PERO_NORD.name,
+					"autogrill restaurant"
+				),
 			};
 		}
 
@@ -84,65 +92,108 @@ export async function searchPlaces(
 				const radius = 5000; // 5km radius
 
 				// Overpass QL query: find nodes, ways, relations with key=value around user
-				const overpassQuery = `[out:json];nwr(around:${radius},${userLat},${userLon})["${key}"="${value}"];out center;`;
+				const MAX_RETRIES = 3;
+				const BASE_DELAY = 1000;
+
+				const overpassQuery = `[out:json][timeout:25];nwr(around:${radius},${userLat},${userLon})["${key}"="${value}"];out center;`;
 				const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(
 					overpassQuery
 				)}`;
 
 				console.log("Overpass API URL:", url);
 
-				const response = await fetch(url);
-				if (!response.ok) {
-					console.error("Overpass API error:", response.status);
-					return [];
+				let response;
+				let lastError;
+
+				for (let i = 0; i < MAX_RETRIES; i++) {
+					try {
+						response = await fetch(url);
+						if (response.ok) break;
+
+						// If 504 or 429, retry
+						if (response.status === 504 || response.status === 429) {
+							console.log(
+								`Overpass API ${response.status}, retrying... (${
+									i + 1
+								}/${MAX_RETRIES})`
+							);
+							await new Promise((r) =>
+								setTimeout(r, BASE_DELAY * Math.pow(2, i))
+							);
+							continue;
+						}
+
+						// Other errors, abort
+						console.error("Overpass API error:", response.status);
+						return [];
+					} catch (e) {
+						lastError = e;
+						console.log(
+							`Overpass network error, retrying... (${i + 1}/${MAX_RETRIES})`
+						);
+						await new Promise((r) =>
+							setTimeout(r, BASE_DELAY * Math.pow(2, i))
+						);
+					}
 				}
 
-				const data = await response.json();
-				console.log(
-					`Found ${data?.elements?.length || 0} results via Overpass for ${mappedQuery}`
-				);
+				if (!response || !response.ok) {
+					console.error(
+						"Overpass API failed after retries:",
+						lastError || response?.status
+					);
+					// Fallback to next method (Nominatim) instead of returning empty immediately
+				} else {
+					const data = await response.json();
+					console.log(
+						`Found ${
+							data?.elements?.length || 0
+						} results via Overpass for ${mappedQuery}`
+					);
 
-				if (data && data.elements && data.elements.length > 0) {
-					const results: PlaceResult[] = data.elements
-						.map((element: any) => {
-							const lat = element.lat || element.center?.lat;
-							const lon = element.lon || element.center?.lon;
-							const name =
-								element.tags?.name ||
-								element.tags?.brand ||
-								element.tags?.operator ||
-								`${value.replace("_", " ")} (${element.id})`;
+					if (data && data.elements && data.elements.length > 0) {
+						const results: PlaceResult[] = data.elements
+							.map((element: any) => {
+								const lat = element.lat || element.center?.lat;
+								const lon = element.lon || element.center?.lon;
+								const name =
+									element.tags?.name ||
+									element.tags?.brand ||
+									element.tags?.operator ||
+									`${value.replace("_", " ")} (${element.id})`;
 
-							if (!lat || !lon) return null;
+								if (!lat || !lon) return null;
 
-							const distance = getDistance(
-								userLat,
-								userLon,
-								lat,
-								lon
+								const distance = getDistance(userLat, userLon, lat, lon);
+
+								return {
+									id: String(element.id),
+									name,
+									latitude: parseFloat(lat),
+									longitude: parseFloat(lon),
+									distance: Math.round(distance), // getDistance returns meters
+									image:
+										element.tags?.image ||
+										element.tags?.["image:url"] ||
+										generatePlaceImage(name, query),
+								};
+							})
+							.filter((item: PlaceResult | null) => item !== null)
+							.sort(
+								(a: PlaceResult, b: PlaceResult) =>
+									(a.distance || 0) - (b.distance || 0)
 							);
 
-							return {
-								name,
-								latitude: parseFloat(lat),
-								longitude: parseFloat(lon),
-								distance: Math.round(distance), // getDistance returns meters
-								image: element.tags?.image || element.tags?.["image:url"] || generatePlaceImage(name, query),
-							};
-						})
-						.filter((item: PlaceResult | null) => item !== null)
-						.sort(
-							(a: PlaceResult, b: PlaceResult) =>
-								(a.distance || 0) - (b.distance || 0)
-						);
+						if (injectedResult) {
+							results.unshift(injectedResult);
+						}
 
-					if (injectedResult) {
-						results.unshift(injectedResult);
+						return results as PlaceResult[];
 					}
-
-					return results as PlaceResult[];
 				}
-				return [];
+				console.log(
+					"Overpass returned no results or failed, falling back to Nominatim..."
+				);
 			}
 		}
 
@@ -187,17 +238,19 @@ export async function searchPlaces(
 						parseFloat(item.lon)
 					);
 					return {
+						id: String(item.place_id || item.osm_id),
 						name: item.name || item.display_name.split(",")[0],
 						latitude: parseFloat(item.lat),
 						longitude: parseFloat(item.lon),
 						address: item.display_name,
 						distance: Math.round(distance), // getDistance returns meters
-						image: generatePlaceImage(item.name || item.display_name.split(",")[0], query),
+						image: generatePlaceImage(
+							item.name || item.display_name.split(",")[0],
+							query
+						),
 					};
 				})
-				.sort(
-					(a: any, b: any) => (a.distance || 0) - (b.distance || 0)
-				);
+				.sort((a: any, b: any) => (a.distance || 0) - (b.distance || 0));
 
 			if (injectedResult) {
 				(results as PlaceResult[]).unshift(injectedResult);
@@ -217,7 +270,7 @@ export async function searchPlaces(
 	}
 }
 
-function getDistance(
+export function getDistance(
 	lat1: number,
 	lon1: number,
 	lat2: number,
@@ -237,11 +290,11 @@ function getDistance(
 	return R * c;
 }
 
-function generatePlaceImage(name: string, query: string): string {
+export function generatePlaceImage(name: string, query: string): string {
 	const cleanName = name.replace(/[^a-zA-Z0-9 ]/g, "");
 	const prompt = `${cleanName} ${query} exterior`;
 	const encodedPrompt = encodeURIComponent(prompt);
-	
+
 	// Use Bing's thumbnail service to get a real web image
 	return `https://tse4.mm.bing.net/th?q=${encodedPrompt}&w=400&h=300&c=7&rs=1`;
 }

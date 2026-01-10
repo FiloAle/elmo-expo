@@ -17,7 +17,7 @@ export interface RouteOptions {
 	avoidHighways: boolean;
 }
 
-export type DeviceRole = 'car1-main' | 'car1-rear' | 'car2-main' | 'car2-rear';
+export type DeviceRole = "car1-main" | "car1-rear" | "car2-main" | "car2-rear";
 
 interface SettingsModalProps {
 	visible: boolean;
@@ -26,10 +26,6 @@ interface SettingsModalProps {
 	onOptionsChange: (options: RouteOptions) => void;
 	showChat: boolean;
 	onToggleChat: (show: boolean) => void;
-	autopilotEnabled: boolean;
-	onToggleAutopilot: (enabled: boolean) => void;
-	useNativeTTS: boolean;
-	onToggleNativeTTS: (enabled: boolean) => void;
 	syncServerUrl: string;
 	onSyncServerUrlChange: (url: string) => void;
 	deviceRole: DeviceRole;
@@ -47,10 +43,6 @@ export function SettingsModal({
 	onOptionsChange,
 	showChat,
 	onToggleChat,
-	autopilotEnabled,
-	onToggleAutopilot,
-	useNativeTTS,
-	onToggleNativeTTS,
 	syncServerUrl,
 	onSyncServerUrlChange,
 	deviceRole,
@@ -85,7 +77,7 @@ export function SettingsModal({
 			transparent={true}
 			visible={visible}
 			onRequestClose={onClose}
-			supportedOrientations={['landscape']}
+			supportedOrientations={["landscape"]}
 		>
 			<View style={styles.centeredView}>
 				<View style={styles.modalContent}>
@@ -119,7 +111,9 @@ export function SettingsModal({
 										onOptionsChange({ ...routeOptions, avoidHighways: val })
 									}
 									trackColor={{ false: "#374151", true: "#5EEAD4" }}
-									thumbColor={routeOptions.avoidHighways ? "#01181C" : "#f4f3f4"}
+									thumbColor={
+										routeOptions.avoidHighways ? "#01181C" : "#f4f3f4"
+									}
 								/>
 							</View>
 							<View style={styles.toggleRow}>
@@ -141,7 +135,9 @@ export function SettingsModal({
 							onPress={() => setShowDevOptions(!showDevOptions)}
 						>
 							<Text style={styles.devOptionsButtonText}>
-								{showDevOptions ? "Hide Developer Options" : "Show Developer Options"}
+								{showDevOptions
+									? "Hide Developer Options"
+									: "Show Developer Options"}
 							</Text>
 						</TouchableOpacity>
 
@@ -162,12 +158,15 @@ export function SettingsModal({
 											<Ionicons
 												name="car-sport"
 												size={24}
-												color={deviceRole === "car1-main" ? "#01181C" : "#5EEAD4"}
+												color={
+													deviceRole === "car1-main" ? "#01181C" : "#5EEAD4"
+												}
 											/>
 											<Text
 												style={[
 													styles.roleButtonText,
-													deviceRole === "car1-main" && styles.roleButtonTextActive,
+													deviceRole === "car1-main" &&
+														styles.roleButtonTextActive,
 												]}
 											>
 												1st main
@@ -183,12 +182,15 @@ export function SettingsModal({
 											<Ionicons
 												name="phone-portrait-outline"
 												size={24}
-												color={deviceRole === "car1-rear" ? "#01181C" : "#5EEAD4"}
+												color={
+													deviceRole === "car1-rear" ? "#01181C" : "#5EEAD4"
+												}
 											/>
 											<Text
 												style={[
 													styles.roleButtonText,
-													deviceRole === "car1-rear" && styles.roleButtonTextActive,
+													deviceRole === "car1-rear" &&
+														styles.roleButtonTextActive,
 												]}
 											>
 												1st rear
@@ -204,12 +206,15 @@ export function SettingsModal({
 											<Ionicons
 												name="car-sport"
 												size={24}
-												color={deviceRole === "car2-main" ? "#01181C" : "#5EEAD4"}
+												color={
+													deviceRole === "car2-main" ? "#01181C" : "#5EEAD4"
+												}
 											/>
 											<Text
 												style={[
 													styles.roleButtonText,
-													deviceRole === "car2-main" && styles.roleButtonTextActive,
+													deviceRole === "car2-main" &&
+														styles.roleButtonTextActive,
 												]}
 											>
 												2nd main
@@ -226,25 +231,32 @@ export function SettingsModal({
 											style={styles.input}
 											value={localSyncUrl}
 											onChangeText={setLocalSyncUrl}
-											placeholder="192.168.1.1:3001"
+											placeholder="192.168.1.1"
 											placeholderTextColor="#6b7280"
 											autoCapitalize="none"
 											autoCorrect={false}
 										/>
-										<TouchableOpacity 
+										<TouchableOpacity
 											style={styles.connectButton}
 											onPress={handleConnect}
 										>
 											<Text style={styles.connectButtonText}>Connect</Text>
 										</TouchableOpacity>
-										<View style={[styles.connectionIndicator, { backgroundColor: isConnected ? "#22c55e" : "#ef4444" }]} />
+										<View
+											style={[
+												styles.connectionIndicator,
+												{
+													backgroundColor: isConnected ? "#22c55e" : "#ef4444",
+												},
+											]}
+										/>
 									</View>
 								</View>
 
 								{/* Toggles */}
 								<View style={styles.section}>
 									<Text style={styles.sectionTitle}>Preferences</Text>
-									
+
 									<View style={styles.toggleRow}>
 										<Text style={styles.toggleLabel}>Show Chat Overlay</Text>
 										<Switch
@@ -254,29 +266,8 @@ export function SettingsModal({
 											thumbColor={showChat ? "#01181C" : "#f4f3f4"}
 										/>
 									</View>
-
-									<View style={styles.toggleRow}>
-										<Text style={styles.toggleLabel}>Autopilot Simulation</Text>
-										<Switch
-											value={autopilotEnabled}
-											onValueChange={onToggleAutopilot}
-											trackColor={{ false: "#374151", true: "#5EEAD4" }}
-											thumbColor={autopilotEnabled ? "#01181C" : "#f4f3f4"}
-										/>
-									</View>
-
-									<View style={styles.toggleRow}>
-										<Text style={styles.toggleLabel}>Use Native TTS (Offline)</Text>
-										<Switch
-											value={useNativeTTS}
-											onValueChange={onToggleNativeTTS}
-											trackColor={{ false: "#374151", true: "#5EEAD4" }}
-											thumbColor={useNativeTTS ? "#01181C" : "#f4f3f4"}
-										/>
-									</View>
 								</View>
 
-								{/* Scenarios - Only for Car 1 Main */}
 								{deviceRole === "car1-main" && (
 									<View style={styles.section}>
 										<Text style={styles.sectionTitle}>Debug Scenarios</Text>
@@ -285,25 +276,31 @@ export function SettingsModal({
 												style={styles.scenarioButton}
 												onPress={onStartScenario1}
 											>
-												<Text style={styles.scenarioButtonText}>Monte Bianco</Text>
+												<Text style={styles.scenarioButtonText}>
+													Monte Bianco
+												</Text>
 											</TouchableOpacity>
 											<TouchableOpacity
 												style={styles.scenarioButton}
 												onPress={onStartScenario2}
 											>
-												<Text style={styles.scenarioButtonText}>Busto Garolfo</Text>
+												<Text style={styles.scenarioButtonText}>
+													Busto Garolfo
+												</Text>
 											</TouchableOpacity>
 										</View>
 
-										{deviceRole === "car1-main" && (
-											<TouchableOpacity
-												style={styles.resetButton}
-												onPress={onResetToDefault}
-											>
-												<Ionicons name="refresh" size={20} color="#01181C" />
-												<Text style={styles.resetButtonText}>Reset to Default</Text>
-											</TouchableOpacity>
-										)}
+										<TouchableOpacity
+											style={styles.resetButton}
+											onPress={onResetToDefault}
+										>
+											<Ionicons name="refresh" size={20} color="#01181C" />
+											<Text style={styles.resetButtonText}>
+												Reset to Default
+											</Text>
+										</TouchableOpacity>
+
+										{/* Reset Button moved to separate section */}
 									</View>
 								)}
 							</>
@@ -373,9 +370,9 @@ const styles = StyleSheet.create({
 		color: "white",
 	},
 	buttonGrid: {
-		flexDirection: 'row',
+		flexDirection: "row",
 		gap: 8,
-		alignItems: 'center',
+		alignItems: "center",
 	},
 	scenarioButton: {
 		flex: 1,
@@ -433,9 +430,9 @@ const styles = StyleSheet.create({
 		fontWeight: "600",
 	},
 	inputRow: {
-		flexDirection: 'row',
+		flexDirection: "row",
 		gap: 8,
-		alignItems: 'center',
+		alignItems: "center",
 	},
 	input: {
 		flex: 1,
@@ -452,7 +449,7 @@ const styles = StyleSheet.create({
 		paddingHorizontal: 16,
 		paddingVertical: 12,
 		borderRadius: 8,
-		justifyContent: 'center',
+		justifyContent: "center",
 	},
 	connectButtonText: {
 		color: "#01181C",

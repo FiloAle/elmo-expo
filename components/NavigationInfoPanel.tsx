@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
 
 type NavigationInfoPanelProps = {
 	duration: number; // seconds
@@ -14,7 +15,7 @@ type NavigationInfoPanelProps = {
 	totalDistance: number; // Total remaining trip distance
 	totalDuration: number; // Total remaining trip duration
 	progress?: number; // 0-1, overall trip progress
-	nextStopProgress?: number; // 0-1, position of next stop on timeline
+	stopsProgress?: number[]; // Array of 0-1 values for intermediate stops
 };
 
 export function NavigationInfoPanel({
@@ -30,7 +31,7 @@ export function NavigationInfoPanel({
 	totalDistance,
 	totalDuration,
 	progress = 0,
-	nextStopProgress,
+	stopsProgress,
 }: NavigationInfoPanelProps) {
 	// Throttled values that only update once per minute
 	const [throttledDuration, setThrottledDuration] = useState(duration);
@@ -48,27 +49,25 @@ export function NavigationInfoPanel({
 	useEffect(() => {
 		const durationChange = Math.abs(duration - lastDurationRef.current);
 		// Update if duration changes significantly OR if number of legs changes (stop added/removed)
-		const isNewRoute = durationChange > 300 || legs.length !== (lastDurationRef.current ? 0 : legs.length); // Hacky check, better to track lastLegsLength
-		
-		// Actually, let's just track lastLegsLength
-		// But we can just assume if duration changes > 60s it's worth updating?
-		// Or just always update if legs.length changes.
-		
-		// Let's use a more robust check:
-		// If duration changes by > 1 minute OR legs length changes, reset.
-		if (durationChange > 60 || (legs && legs.length !== (lastLegsLengthRef.current || 0))) {
+		if (
+			durationChange > 60 ||
+			(legs && legs.length !== (lastLegsLengthRef.current || 0))
+		) {
 			// Reset all throttled values immediately for new route
 			setThrottledDuration(duration);
 			setThrottledDistance(Math.floor(distance / 50) * 50);
-			
+
 			const currentTime = new Date();
 			const arrivalTime = new Date(currentTime.getTime() + duration * 1000);
-			const eta = `${arrivalTime.getHours().toString().padStart(2, "0")}:${arrivalTime
+			const eta = `${arrivalTime
+				.getHours()
+				.toString()
+				.padStart(2, "0")}:${arrivalTime
 				.getMinutes()
 				.toString()
 				.padStart(2, "0")}`;
 			setThrottledEta(eta);
-			
+
 			lastUpdateRef.current = Date.now();
 			lastDurationRef.current = duration;
 			lastLegsLengthRef.current = legs.length;
@@ -87,20 +86,23 @@ export function NavigationInfoPanel({
 	useEffect(() => {
 		const now = Date.now();
 		const timeSinceLastUpdate = now - lastUpdateRef.current;
-		
+
 		// Update immediately on first render or after 60 seconds
 		if (timeSinceLastUpdate >= 60000 || throttledEta === "") {
 			setThrottledDuration(duration);
-			
+
 			// Calculate ETA
 			const currentTime = new Date();
 			const arrivalTime = new Date(currentTime.getTime() + duration * 1000);
-			const eta = `${arrivalTime.getHours().toString().padStart(2, "0")}:${arrivalTime
+			const eta = `${arrivalTime
+				.getHours()
+				.toString()
+				.padStart(2, "0")}:${arrivalTime
 				.getMinutes()
 				.toString()
 				.padStart(2, "0")}`;
 			setThrottledEta(eta);
-			
+
 			lastUpdateRef.current = now;
 		}
 	}, [duration]);
@@ -133,9 +135,6 @@ export function NavigationInfoPanel({
 	// Total duration for multi-stop trips
 	const totalDurationText = formatDuration(totalDuration);
 
-	// Progress is now passed as prop
-
-
 	return (
 		<View style={styles.container}>
 			<View style={styles.row}>
@@ -160,17 +159,40 @@ export function NavigationInfoPanel({
 			{/* Timeline */}
 			<View style={styles.timelineContainer}>
 				<View style={styles.timelineBackground}>
-					<View style={[styles.timelineFill, { width: `${progress * 100}%` }]} />
-				</View>
-				{/* Next Stop Icon on Timeline */}
-				{hasWaypoints && nextStopProgress !== undefined && (
-					<View 
-						style={[
-							styles.timelineStopIcon, 
-							{ left: `${nextStopProgress * 100}%` }
-						]} 
+					<View
+						style={[styles.timelineFill, { width: `${progress * 100}%` }]}
 					/>
-				)}
+				</View>
+				{/* Navigation Arrow */}
+				<View style={[styles.navArrow, { left: `${progress * 100}%` }]}>
+					{/* Background Fill Icon */}
+					<Ionicons
+						name="navigate"
+						size={22}
+						color="#01181C"
+						style={{
+							position: "absolute",
+							top: 0,
+							left: 0,
+							transform: [{ rotate: "45deg" }],
+						}}
+					/>
+					{/* Outline Icon */}
+					<Ionicons
+						name="navigate-outline"
+						size={22}
+						color="#5EEAD4"
+						style={{ transform: [{ rotate: "45deg" }] }}
+					/>
+				</View>
+				{/* Intermediate Stop Icons on Timeline */}
+				{stopsProgress &&
+					stopsProgress.map((stopProg, idx) => (
+						<View
+							key={idx}
+							style={[styles.timelineStopIcon, { left: `${stopProg * 100}%` }]}
+						/>
+					))}
 			</View>
 
 			{hasWaypoints && (
@@ -190,7 +212,7 @@ export function NavigationInfoPanel({
 						<Text style={styles.buttonText}>Start</Text>
 					</TouchableOpacity>
 				)}
-				
+
 				{isPaused && onResume && (
 					<TouchableOpacity
 						style={[styles.button, styles.resumeButton]}
@@ -205,7 +227,7 @@ export function NavigationInfoPanel({
 					onPress={onCancel}
 				>
 					<Text style={[styles.buttonText, { color: "#ef4444" }]}>End</Text>
-				</TouchableOpacity>				
+				</TouchableOpacity>
 			</View>
 		</View>
 	);
@@ -252,6 +274,17 @@ const styles = StyleSheet.create({
 	timelineFill: {
 		height: "100%",
 		backgroundColor: "#5EEAD4",
+	},
+	navArrow: {
+		position: "absolute",
+		top: -9.5, // Moved up another 0.25px from -9.25
+		marginLeft: -11, // -22/2
+		width: 22,
+		height: 22,
+		justifyContent: "center",
+		alignItems: "center",
+		zIndex: 20,
+		elevation: 10,
 	},
 	timelineStopIcon: {
 		position: "absolute",

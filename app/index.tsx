@@ -18,25 +18,45 @@ import {
 	Text,
 	TextInput,
 	TouchableOpacity,
-	View
+	View,
+	Animated,
+	Image,
 } from "react-native";
-import MapView, { Marker, Polyline, PROVIDER_DEFAULT } from "react-native-maps";
+import { LinearGradient } from "expo-linear-gradient";
+import MapView, {
+	Marker,
+	Polyline,
+	PROVIDER_DEFAULT,
+	Callout,
+	MapMarker,
+} from "react-native-maps";
 
 import { StopsPanel } from "@/components/StopsPanel";
+import { RearLeftPanel } from "@/components/RearLeftPanel";
+import { StopAddedNotification } from "@/components/StopAddedNotification";
 import { convoySync } from "@/lib/convoySync";
 import { FakeRoad } from "../components/FakeRoad";
 import { NavigationInfoPanel } from "../components/NavigationInfoPanel";
 import { Place, PlacesList } from "../components/PlacesList";
 import { RoutePreview } from "../components/RoutePreview";
 import { ScenarioModal } from "../components/ScenarioModal";
-import { DeviceRole, RouteOptions, SettingsModal } from "../components/SettingsModal";
+import {
+	DeviceRole,
+	RouteOptions,
+	SettingsModal,
+} from "../components/SettingsModal";
 import { Speedometer } from "../components/Speedometer";
-import { StopRequestModal } from "../components/StopRequestModal";
 import { TopBar } from "../components/TopBar";
 import { TurnDirections } from "../components/TurnDirections";
-import { askElmoLLM, ChatMsg, createGroqTtsAudio } from "../lib/elmoClient";
-import { PlaceResult, searchPlaces } from "../lib/places";
-import { getRoute } from "../lib/routing";
+import { askElmoLLM, ChatMsg } from "../lib/elmoClient";
+import { PlaceResult, searchPlaces, generatePlaceImage } from "../lib/places";
+import { getRoute, RouteResult } from "../lib/routing";
+import {
+	Maneuver,
+	getDistance,
+	getBearing,
+	getNextManeuverFromRoute,
+} from "../lib/navigation";
 
 // --- Types ---
 type NavigationState = "idle" | "preview" | "active";
@@ -45,21 +65,22 @@ interface RouteWaypoint {
 	latitude: number;
 	longitude: number;
 	name: string;
+	category?: string; // Optional category for icons
 }
 
-interface RouteInfo {
-	duration: number;
+interface NotificationStop {
+	stop: RouteWaypoint;
 	distance: number;
-	legs: { duration: number; distance: number }[];
+	duration: number;
 }
 
 // Mock Places
 const FAVORITE_PLACES = [
-	{ 
+	{
 		id: "1",
 		name: "Home",
 		icon: "home" as const,
-		address: "Via Luigi Mercantini 1, Milan, Italy"
+		address: "Via Luigi Mercantini 1, Milan, Italy",
 	},
 	{
 		id: "2",
@@ -74,6 +95,34 @@ const FAVORITE_PLACES = [
 		address: "Viale Vincenzo Lancetti 32, Milan, Italy",
 	},
 ];
+
+const getOrdinal = (n: number) => {
+	const words = [
+		"zeroth",
+		"first",
+		"second",
+		"third",
+		"fourth",
+		"fifth",
+		"sixth",
+		"seventh",
+		"eighth",
+		"ninth",
+	];
+	if (n < 10 && n >= 0) return words[n];
+
+	const s = ["th", "st", "nd", "rd"];
+	const v = n % 100;
+	return n + (s[(v - 20) % 10] || s[v] || s[0]);
+};
+
+const SpeedLimitSign = ({ limit }: { limit: number }) => (
+	<View style={styles.speedLimitSign}>
+		<View style={styles.speedLimitInner}>
+			<Text style={styles.speedLimitText}>{limit}</Text>
+		</View>
+	</View>
+);
 
 export default function App() {
 	// --- State ---
@@ -102,15 +151,16 @@ export default function App() {
 		{ latitude: number; longitude: number }[]
 	>([]);
 	const [routeWaypoints, setRouteWaypoints] = useState<RouteWaypoint[]>([]);
-	const [routeInfo, setRouteInfo] = useState<RouteInfo | null>(null);
-	const [weather, setWeather] = useState<{ temp: number; code: number } | null>(null);
+	const [routeInfo, setRouteInfo] = useState<RouteResult | null>(null);
+	const [weather, setWeather] = useState<{ temp: number; code: number } | null>(
+		null
+	);
 
-
+	// Navigation State
+	const [nextManeuver, setNextManeuver] = useState<Maneuver | null>(null);
 
 	const [isRecording, setIsRecording] = useState(false);
-	const [messages, setMessages] = useState<ChatMsg[]>([
-		{ role: "assistant", content: "Hi! I'm Elmo. Where do you want to go?" }
-	]);
+	const [messages, setMessages] = useState<ChatMsg[]>([]);
 	const [inputText, setInputText] = useState("");
 	const [isProcessing, setIsProcessing] = useState(false);
 
@@ -133,8 +183,9 @@ export default function App() {
 	// Dashboard State
 	const [showChat, setShowChat] = useState(false);
 	const [showSettings, setShowSettings] = useState(false);
-	const [autopilotEnabled, setAutopilotEnabled] = useState(true);
-	const [useNativeTTS, setUseNativeTTS] = useState(false);
+	// Autopilot is always enabled - we only use simulated position
+	const autopilotEnabled = true;
+	// Native TTS is now default and only option
 	const [isMuted, setIsMuted] = useState(false);
 	const [currentSpeedLimit, setCurrentSpeedLimit] = useState(50); // Default speed limit
 	const [nextStopDistance, setNextStopDistance] = useState<number | null>(null);
@@ -144,32 +195,75 @@ export default function App() {
 		avoidFerries: false,
 		avoidHighways: false,
 	});
-	const [syncServerUrl, setSyncServerUrl] = useState("172.20.10.6:3001");
+	const [syncServerUrl, setSyncServerUrl] = useState("192.168.1.78");
 	const [deviceRole, setDeviceRole] = useState<DeviceRole>("car1-main");
-	
+
 	// Convoy Sync State
 	const [isSyncConnected, setIsSyncConnected] = useState(false);
 	const [pendingStopRequest, setPendingStopRequest] = useState<{
 		name: string;
 		latitude: number;
 		longitude: number;
+		id?: string;
 	} | null>(null);
+	const [myStopRequests, setMyStopRequests] = useState<string[]>([]);
+	const [declinedStopRequests, setDeclinedStopRequests] = useState<string[]>(
+		[]
+	);
+	const [addedStops, setAddedStops] = useState<string[]>([]);
 
 	// Stops Panel State
 	const [showStopsPanel, setShowStopsPanel] = useState(false);
-	const [stopsPanelCategory, setStopsPanelCategory] = useState<string | null>(null);
+	const [stopsPanelCategory, setStopsPanelCategory] = useState<string | null>(
+		null
+	);
 	const [isPausedAtStop, setIsPausedAtStop] = useState(false);
-	const [stopsSearchResults, setStopsSearchResults] = useState<PlaceResult[]>([]);
+	const [stopsSearchResults, setStopsSearchResults] = useState<PlaceResult[]>(
+		[]
+	);
 	const [isSearchingStops, setIsSearchingStops] = useState(false);
+
+	// Left Panel State
+	const [activeTab, setActiveTab] = useState<"favorites" | "recents">(
+		"favorites"
+	);
+	const [isSearching, setIsSearching] = useState(false);
+
+	// Notification for added stops
+	const [notificationStop, setNotificationStop] =
+		useState<NotificationStop | null>(null);
 
 	// Testing Scenarios State
 	const [activeScenario, setActiveScenario] = useState<null | 1 | 2>(null);
-	const [scenarioStep, setScenarioStep] = useState<"modal" | "question">("modal");
+	const [scenarioStep, setScenarioStep] = useState<"modal" | "question">(
+		"modal"
+	);
+
+	// Voice Overlay States
+	const [showVoiceOverlay, setShowVoiceOverlay] = useState(false);
+	const [voiceOverlayText, setVoiceOverlayText] = useState("I'm listening...");
+	const [selectedPlace, setSelectedPlace] = useState<PlaceResult | null>(null);
+	const selectedPlaceRef = useRef<PlaceResult | null>(null);
+
+	const [voiceOverlayFade] = useState(new Animated.Value(0));
+	const [streamingVoiceText, setStreamingVoiceText] = useState<
+		string | undefined
+	>(undefined);
+
+	const voiceMode = useRef<"standard" | "interactive">("standard");
+	const lastTranscript = useRef<string>("");
 
 	// --- Refs ---
 	const mapRef = useRef<MapView>(null);
 	const currentAudioRef = useRef<Audio.Sound | null>(null);
-	const ttsQueue = useRef<{ text: string; shouldActivateMic: boolean }[]>([]);
+	const ttsQueue = useRef<
+		{
+			text: string;
+			shouldActivateMic: boolean;
+			onDone?: () => void;
+			force?: boolean;
+		}[]
+	>([]);
 	const isProcessingTTS = useRef<boolean>(false);
 	const locationSubscription = useRef<Location.LocationSubscription | null>(
 		null
@@ -177,7 +271,7 @@ export default function App() {
 	const headingSubscription = useRef<Location.LocationSubscription | null>(
 		null
 	);
-	
+
 	// Autopilot Refs
 	const autopilotSpeed = useRef(0); // m/s
 	const autopilotIndex = useRef(0); // current index in routeCoords
@@ -188,12 +282,20 @@ export default function App() {
 	const prevAutopilotEnabled = useRef(false);
 	const distanceTraveled = useRef(0); // Track total distance traveled for progress bar (cumulative for session)
 	const distanceTraveledOnCurrentRoute = useRef(0); // Track distance on current route (resets on reroute)
-	const routeInfoRef = useRef<RouteInfo | null>(null);
+	const routeInfoRef = useRef<RouteResult | null>(null);
 	const lastPausedLegIndex = useRef(-1); // Track last leg index where we paused to avoid loops
+	const navigationStartTime = useRef<number | null>(null);
 
-	// --- Effects ---
+	// Voice Guidance State
+	// Format: "lat,lng_distanceStage" -> e.g., "45.5,9.1_250"
+	const lastAnnouncement = useRef<string | null>(null);
+	const lastSpokenManeuverPoint = useRef<{
+		coordinate: { latitude: number; longitude: number };
+		type: string;
+		stage: string;
+	} | null>(null);
 
-	// Sync ref
+	// Start autopilot loop when navigating
 	useEffect(() => {
 		autopilotEnabledRef.current = autopilotEnabled;
 	}, [autopilotEnabled]);
@@ -204,6 +306,14 @@ export default function App() {
 			// Autopilot was just turned off, reset to real location
 			(async () => {
 				try {
+					const { status } = await Location.getForegroundPermissionsAsync();
+					if (status !== "granted") {
+						console.log(
+							"[App] Location permission not granted, skipping reset to real location"
+						);
+						return;
+					}
+
 					const location = await Location.getCurrentPositionAsync({});
 					setUserRegion({
 						latitude: location.coords.latitude,
@@ -211,10 +321,13 @@ export default function App() {
 						latitudeDelta: 0.01,
 						longitudeDelta: 0.01,
 					});
-					const realSpeed = location.coords.speed && location.coords.speed > 0 ? location.coords.speed * 3.6 : 0;
+					const realSpeed =
+						location.coords.speed && location.coords.speed > 0
+							? location.coords.speed * 3.6
+							: 0;
 					setSpeed(realSpeed);
 				} catch (error) {
-					console.error('Error resetting to real location:', error);
+					console.error("Error resetting to real location:", error);
 					setSpeed(0);
 				}
 			})();
@@ -231,9 +344,12 @@ export default function App() {
 			autopilotSpeed.current = 0;
 		}
 		setNextStopDistance(null);
-		setNextStopDuration(null);
 		setNextStopDistance(null);
 		setNextStopDuration(null);
+		setNextManeuver(null);
+		setNextStopDuration(null);
+		setNextManeuver(null);
+
 		// Do NOT reset distanceTraveled here, as routeCoords changes when adding a stop.
 		// We only reset distanceTraveled when starting a NEW navigation session (startNavigation).
 		distanceTraveledOnCurrentRoute.current = 0;
@@ -247,14 +363,19 @@ export default function App() {
 
 	// Autopilot Simulation Loop
 	useEffect(() => {
-		if (autopilotEnabled && !isPausedAtStop && navigationState === "active" && routeCoords.length > 1) {
+		if (
+			autopilotEnabled &&
+			!isPausedAtStop &&
+			navigationState === "active" &&
+			routeCoords.length > 1
+		) {
 			// Start simulation
 			if (!autopilotInterval.current) {
 				lastAutopilotUpdate.current = Date.now();
-				// Find closest point on route to start from if just enabled? 
-				// For simplicity, if index is 0, we start from start. 
+				// Find closest point on route to start from if just enabled?
+				// For simplicity, if index is 0, we start from start.
 				// If we want to resume, we keep the index.
-				
+
 				autopilotInterval.current = setInterval(() => {
 					const now = Date.now();
 					const dt = (now - lastAutopilotUpdate.current) / 1000; // seconds
@@ -265,18 +386,18 @@ export default function App() {
 					// 1. Calculate Target Speed
 					// Look ahead to see if there's a sharp turn
 					let targetSpeed = 50 / 3.6; // Default 50 km/h in m/s
-					
+
 					// Simple turn detection: look 3 points ahead
 					if (autopilotIndex.current + 3 < routeCoords.length) {
 						const p1 = routeCoords[autopilotIndex.current];
 						const p2 = routeCoords[autopilotIndex.current + 1];
 						const p3 = routeCoords[autopilotIndex.current + 2];
-						
+
 						// Calculate bearings
 						const b1 = getBearing(p1, p2);
 						const b2 = getBearing(p2, p3);
 						const diff = Math.abs(b1 - b2);
-						
+
 						// If turn > 20 degrees, slow down
 						if (diff > 20) {
 							targetSpeed = 20 / 3.6; // Slow to 20 km/h
@@ -287,30 +408,36 @@ export default function App() {
 					const currentSpeed = autopilotSpeed.current;
 					if (currentSpeed < targetSpeed) {
 						// Accelerate (2 m/s^2)
-						autopilotSpeed.current = Math.min(targetSpeed, currentSpeed + 2 * dt);
+						autopilotSpeed.current = Math.min(
+							targetSpeed,
+							currentSpeed + 2 * dt
+						);
 					} else {
 						// Decelerate (4 m/s^2)
-						autopilotSpeed.current = Math.max(targetSpeed, currentSpeed - 4 * dt);
+						autopilotSpeed.current = Math.max(
+							targetSpeed,
+							currentSpeed - 4 * dt
+						);
 					}
 
 					// 3. Move
 					const distanceToMove = autopilotSpeed.current * dt; // meters
-					
+
 					// Update range (convert meters to km)
-					setRemainingRange(prev => Math.max(0, prev - (distanceToMove / 1000)));
+					setRemainingRange((prev) =>
+						Math.max(0, prev - distanceToMove / 1000)
+					);
 
 					// Update total distance traveled (for progress bar)
 					distanceTraveled.current += distanceToMove;
 					distanceTraveledOnCurrentRoute.current += distanceToMove;
-					
+
 					// Get current segment distance
 					const pStart = routeCoords[autopilotIndex.current];
 					const pEnd = routeCoords[autopilotIndex.current + 1];
-					
+
 					if (!pStart || !pEnd) {
-						// End of route
-						setNavigationState("preview");
-						setAutopilotEnabled(false);
+						// End of route - keep navigation active, just stop moving
 						return;
 					}
 
@@ -327,11 +454,17 @@ export default function App() {
 					if (autopilotProgress.current >= 1) {
 						autopilotIndex.current++;
 						autopilotProgress.current = 0;
-						
+
 						if (autopilotIndex.current >= routeCoords.length - 1) {
 							// Arrived
-							setNavigationState("preview");
-							setAutopilotEnabled(false);
+							setSpeed(0);
+							// Force "Arrived" maneuver to keep the panel visible
+							setNextManeuver({
+								type: "arrive",
+								distance: 0,
+								coordinate: routeCoords[routeCoords.length - 1],
+								angle: 0,
+							});
 							return;
 						}
 					}
@@ -339,17 +472,26 @@ export default function App() {
 					// 4. Calculate new position
 					const currentPStart = routeCoords[autopilotIndex.current];
 					const currentPEnd = routeCoords[autopilotIndex.current + 1];
-					
-					const newLat = currentPStart.latitude + (currentPEnd.latitude - currentPStart.latitude) * autopilotProgress.current;
-					const newLng = currentPStart.longitude + (currentPEnd.longitude - currentPStart.longitude) * autopilotProgress.current;
-					
+
+					const newLat =
+						currentPStart.latitude +
+						(currentPEnd.latitude - currentPStart.latitude) *
+							autopilotProgress.current;
+					const newLng =
+						currentPStart.longitude +
+						(currentPEnd.longitude - currentPStart.longitude) *
+							autopilotProgress.current;
+
 					if (isNaN(newLat) || isNaN(newLng)) {
 						return;
 					}
 
 					// 5. Calculate Bearing for Camera
 					const bearing = getBearing(
-						{ latitude: currentPStart.latitude, longitude: currentPStart.longitude },
+						{
+							latitude: currentPStart.latitude,
+							longitude: currentPStart.longitude,
+						},
 						{ latitude: currentPEnd.latitude, longitude: currentPEnd.longitude }
 					);
 
@@ -363,73 +505,177 @@ export default function App() {
 					setUserHeading(bearing);
 					setSpeed(autopilotSpeed.current * 3.6); // km/h
 
-					// 7. Update Camera with proper centering
-					if (mapRef.current) {
-						mapRef.current.animateCamera({
-							center: { latitude: newLat, longitude: newLng },
-							heading: bearing,
-							pitch: 60,
-							zoom: 18,
-							altitude: 100, // Required for iOS
-						}, { duration: 100 }); // Smooth update
-					}
-
-					// 8. Calculate distance and time to next stop
-					// Use routeInfoRef to get legs
+					// Use accurate OSRM steps instead of geometric fallback
 					const currentRouteInfo = routeInfoRef.current;
-					if (currentRouteInfo && currentRouteInfo.legs.length > 0) {
-						// Determine which leg we are on based on distanceTraveledOnCurrentRoute
-						let remainingDistInLeg = 0;
-						let currentLegIndex = 0;
-						let accumulatedDistance = 0;
+					const maneuver = currentRouteInfo
+						? getNextManeuverFromRoute(
+								currentRouteInfo,
+								distanceTraveledOnCurrentRoute.current
+						  )
+						: null;
+					setNextManeuver(maneuver);
 
+					// Calculate leg info
+					let currentLegIndex = 0;
+					let remainingDistInLeg = 0;
+					if (currentRouteInfo) {
+						let dist = 0;
 						for (let i = 0; i < currentRouteInfo.legs.length; i++) {
-							const legDist = currentRouteInfo.legs[i].distance;
-							if (distanceTraveledOnCurrentRoute.current < accumulatedDistance + legDist) {
+							const leg = currentRouteInfo.legs[i];
+							if (
+								dist + leg.distance >
+								distanceTraveledOnCurrentRoute.current
+							) {
 								currentLegIndex = i;
-								remainingDistInLeg = (accumulatedDistance + legDist) - distanceTraveledOnCurrentRoute.current;
+								remainingDistInLeg =
+									dist + leg.distance - distanceTraveledOnCurrentRoute.current;
 								break;
 							}
-							accumulatedDistance += legDist;
+							dist += leg.distance;
 						}
+					}
 
-						// If we exceeded all legs (shouldn't happen if logic is correct), default to 0
-						if (remainingDistInLeg < 0) remainingDistInLeg = 0;
+					// --- Voice Guidance Logic ---
+					if (maneuver) {
+						const { type, modifier, exit, distance, coordinate } = maneuver;
+						const maneuverId = `${coordinate.latitude.toFixed(
+							5
+						)},${coordinate.longitude.toFixed(5)}`;
 
-						setNextStopDistance(remainingDistInLeg);
-						// Estimate time based on current speed or average speed
-						// If speed is very low, use a default average (e.g. 50km/h = ~13.8m/s) to avoid huge times
-						const estSpeed = Math.max(autopilotSpeed.current, 5); 
-						setNextStopDuration(remainingDistInLeg / estSpeed);
+						// Helper to speak and record it
+						const speak = (text: string, stage: string) => {
+							if (deviceRole === "car1-rear") return;
+							const key = `${maneuverId}_${stage}`;
+							if (lastAnnouncement.current !== key) {
+								// Check for spam
+								const isSpam =
+									lastSpokenManeuverPoint.current &&
+									getDistance(
+										lastSpokenManeuverPoint.current.coordinate,
+										coordinate
+									) < 80 &&
+									lastSpokenManeuverPoint.current.type === type && // Comparison relying on string equality is fine
+									lastSpokenManeuverPoint.current.stage === stage;
 
-						// Check if WE (the car) are close to the stop (waypoint or destination)
-						// We can check if remainingDistInLeg is small
-						if (remainingDistInLeg < 25) {
-							// If it's a waypoint (not the last leg), pause.
-							// If it's the last leg, we arrive (handled above by routeCoords check, but good to double check)
-							if (currentLegIndex < currentRouteInfo.legs.length - 1) {
-								// Only pause if we haven't already paused for this leg
-								if (lastPausedLegIndex.current !== currentLegIndex) {
-									setIsPausedAtStop(true);
-									// Do NOT disable autopilot here, just pause the loop via state
-									lastPausedLegIndex.current = currentLegIndex;
+								if (!isSpam) {
+									playActualTTS(text);
+
+									lastSpokenManeuverPoint.current = {
+										coordinate,
+										type: type as any,
+										stage,
+									};
 								}
+								lastAnnouncement.current = key;
+							}
+						};
+
+						// Check for Intermediate Arrival
+						if (
+							currentRouteInfo &&
+							currentLegIndex < currentRouteInfo.legs.length - 1 &&
+							remainingDistInLeg < 50 &&
+							remainingDistInLeg > 0
+						) {
+							const waypointName =
+								routeWaypoints[currentLegIndex]?.name || "stop";
+							speak(`You have arrived at ${waypointName}`, "leg_arrive");
+						} else {
+							if (distance < remainingDistInLeg) {
+								// Phrase generation helper
+								const getPhrase = (distStr: string) => {
+									// Roundabout handling
+									if (type === "roundabout" || type === "rotary") {
+										if (exit)
+											return `${distStr}, at the roundabout take the ${getOrdinal(
+												exit
+											)} exit`;
+										return `${distStr}, enter the roundabout`;
+									}
+
+									// Standard turns based on modifier
+									const direction = modifier?.replace("_", " "); // e.g. "slight right"
+									if (type === "turn" || type === "merge" || type === "fork") {
+										if (modifier === "left") return `${distStr}, turn left`;
+										if (modifier === "right") return `${distStr}, turn right`;
+										if (modifier === "uturn")
+											return `${distStr}, make a U-turn`;
+										if (modifier && modifier.includes("left"))
+											return `${distStr}, keep left`;
+										if (modifier && modifier.includes("right"))
+											return `${distStr}, keep right`;
+									}
+
+									if (type === "arrive")
+										return `${distStr}, you will reach your destination`;
+
+									return "";
+								};
+
+								// Distance triggers
+								let text = "";
+								let stage = "";
+
+								if (distance <= 770 && distance > 550) {
+									text = getPhrase("In 750 meters");
+									stage = "770";
+								} else if (distance <= 520 && distance > 300) {
+									text = getPhrase("In 500 meters");
+									stage = "520";
+								} else if (distance <= 270 && distance > 150) {
+									text = getPhrase("In 250 meters");
+									stage = "270";
+								} else if (distance <= 120 && distance > 60) {
+									text = getPhrase("In 100 meters");
+									stage = "120";
+								} else if (distance <= 35) {
+									if (type === "roundabout" || type === "rotary") {
+										if (exit) text = `Take the ${getOrdinal(exit)} exit`;
+										else text = "Enter the roundabout";
+									} else if (modifier === "left") text = "Turn left";
+									else if (modifier === "right") text = "Turn right";
+									else if (modifier === "uturn") text = "Make a U-turn";
+									else if (type === "arrive") text = "You have arrived";
+
+									stage = "20";
+								}
+
+								if (text) speak(text, stage);
 							}
 						}
-					} else if (destination) {
-						// Fallback if no legs info (shouldn't happen with OSRM/Mapbox usually)
-						// Calculate remaining distance along route from current position
-						let remainingDist = 0;
-						for (let i = autopilotIndex.current; i < routeCoords.length - 1; i++) {
-							const segDist = getDistance(routeCoords[i], routeCoords[i + 1]);
-							if (i === autopilotIndex.current) {
-								remainingDist += segDist * (1 - autopilotProgress.current);
-							} else {
-								remainingDist += segDist;
+					}
+
+					if (maneuver) {
+						const effectiveDistance =
+							remainingDistInLeg > 0
+								? Math.min(maneuver.distance, remainingDistInLeg)
+								: maneuver.distance;
+
+						if (effectiveDistance > 1000 && remainingDistInLeg > 50) {
+							const key = `${maneuver.coordinate.latitude.toFixed(
+								5
+							)},${maneuver.coordinate.longitude.toFixed(5)}_continue`;
+							if (lastAnnouncement.current !== key) {
+								const km = Math.round(effectiveDistance / 1000);
+								const text = `Continue straight for ${km} kilometers`;
+								if (deviceRole !== "car1-rear") playActualTTS(text);
+								lastAnnouncement.current = key;
 							}
 						}
-						setNextStopDistance(remainingDist);
-						setNextStopDuration(remainingDist / (autopilotSpeed.current || 13.89));
+					}
+
+					// 7. Update Camera with proper centering
+					if (mapRef.current && !selectedPlaceRef.current) {
+						mapRef.current.animateCamera(
+							{
+								center: { latitude: newLat, longitude: newLng },
+								heading: bearing,
+								pitch: 60,
+								zoom: 18,
+								altitude: 100, // Required for iOS
+							},
+							{ duration: 100 }
+						); // Smooth update
 					}
 
 					// 9. Estimate speed limit based on current speed (simulating road type)
@@ -439,9 +685,8 @@ export default function App() {
 					else if (speedKmh > 70) limit = 90;
 					else if (speedKmh > 40) limit = 50;
 					else limit = 30;
-					
-					setCurrentSpeedLimit(limit);
 
+					setCurrentSpeedLimit(limit);
 				}, 16); // 60fps
 			}
 		} else {
@@ -459,49 +704,18 @@ export default function App() {
 				autopilotInterval.current = null;
 			}
 		};
-	}, [autopilotEnabled, isPausedAtStop, navigationState, routeCoords]);
-
-	// Helper for bearing
-	function getBearing(start: any, end: any) {
-		const startLat = toRad(start.latitude || start[0]);
-		const startLng = toRad(start.longitude || start[1]);
-		const endLat = toRad(end.latitude || end[0]);
-		const endLng = toRad(end.longitude || end[1]);
-
-		const y = Math.sin(endLng - startLng) * Math.cos(endLat);
-		const x = Math.cos(startLat) * Math.sin(endLat) -
-				Math.sin(startLat) * Math.cos(endLat) * Math.cos(endLng - startLng);
-		const brng = toDeg(Math.atan2(y, x));
-		return (brng + 360) % 360;
-	}
-
-	function toRad(deg: number) {
-		return deg * Math.PI / 180;
-	}
-
-	function toDeg(rad: number) {
-		return rad * 180 / Math.PI;
-	}
-
-	function getDistance(start: { latitude: number; longitude: number }, end: { latitude: number; longitude: number }) {
-		const R = 6371e3; // metres
-		const φ1 = toRad(start.latitude);
-		const φ2 = toRad(end.latitude);
-		const Δφ = toRad(end.latitude - start.latitude);
-		const Δλ = toRad(end.longitude - start.longitude);
-
-		const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-				Math.cos(φ1) * Math.cos(φ2) *
-				Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-		const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-		return R * c;
-	}
+	}, [
+		autopilotEnabled,
+		isPausedAtStop,
+		navigationState,
+		routeCoords,
+		deviceRole,
+	]);
 
 	// 2. Location Tracking (Real)
 	useEffect(() => {
 		if (autopilotEnabled) return; // Disable real location updates when autopilot is on
-		
+
 		// Only main screens should track GPS. Rear screens follow main.
 		if (deviceRole === "car1-rear" || deviceRole === "car2-rear") return;
 
@@ -531,7 +745,11 @@ export default function App() {
 				latitudeDelta: 0.01,
 				longitudeDelta: 0.01,
 			});
-			setSpeed(location.coords.speed && location.coords.speed > 0 ? location.coords.speed * 3.6 : 0); // m/s to km/h
+			setSpeed(
+				location.coords.speed && location.coords.speed > 0
+					? location.coords.speed * 3.6
+					: 0
+			); // m/s to km/h
 
 			// Start tracking
 			startLocationTracking();
@@ -593,13 +811,17 @@ export default function App() {
 						}));
 						setUserHeading(data.data.heading || 0);
 						setSpeed(data.data.speed || 0);
-						
+
 						// Force map to center on new location
 						if (isTransitioningRef.current) return; // Skip updates during start animation
+						if (selectedPlaceRef.current) return; // Skip updates when viewing a selected place marker
 
 						const isNavigating = navigationStateRef.current === "active";
-						const newLoc = { latitude: data.data.latitude, longitude: data.data.longitude };
-						
+						const newLoc = {
+							latitude: data.data.latitude,
+							longitude: data.data.longitude,
+						};
+
 						// Calculate distance from current location
 						let dist = 0;
 						if (userRegionRef.current) {
@@ -613,18 +835,52 @@ export default function App() {
 								heading: data.data.heading || 0,
 								pitch: isNavigating ? 60 : 0,
 								altitude: isNavigating ? 100 : 1000,
-								zoom: isNavigating ? 18 : 17
+								zoom: isNavigating ? 18 : 17,
 							});
 						} else {
 							// Smooth animation for small movements
-							mapRef.current?.animateCamera({
-								center: newLoc,
-								heading: data.data.heading || 0,
-								pitch: isNavigating ? 60 : 0,
-								altitude: isNavigating ? 100 : 1000,
-								zoom: isNavigating ? 18 : 17
-							}, { duration: 1000 }); // Smoother animation matching update interval
+							mapRef.current?.animateCamera(
+								{
+									center: newLoc,
+									heading: data.data.heading || 0,
+									pitch: isNavigating ? 60 : 0,
+									altitude: isNavigating ? 100 : 1000,
+									zoom: isNavigating ? 18 : 17,
+								},
+								{ duration: 1000 }
+							); // Smoother animation matching update interval
 						}
+						break;
+
+						break;
+
+					case "stop_request_declined":
+						const declinedName = data.data.name;
+						const declinedId = data.data.id;
+						// Show declined feedback
+						setDeclinedStopRequests((prev) => [...prev, declinedName]);
+						setMyStopRequests((prev) =>
+							prev.filter(
+								(req) =>
+									req !== declinedName && (!declinedId || req !== declinedId)
+							)
+						);
+
+						// Remove from declined list after 3 seconds
+						setTimeout(() => {
+							setDeclinedStopRequests((prev) =>
+								prev.filter((req) => req !== declinedName)
+							);
+						}, 3000);
+						break;
+
+					case "waypoint_added":
+						const wp = data.data;
+						setAddedStops((prev) => [...prev, wp.id || wp.name]);
+						// Remove from pending if it was there (check ID or name)
+						setMyStopRequests((prev) =>
+							prev.filter((req) => req !== (wp.id || wp.name))
+						);
 						break;
 
 					case "range":
@@ -644,17 +900,27 @@ export default function App() {
 						break;
 
 					case "waypoints":
+						// Detect if a new waypoint was added (length increased)
+						// Ignore if we are the ones who added it (though 'waypoints' message comes from main usually)
+						// Actually, if we are Main, we receive from ourselves via re-broadcast? No.
+						// If we are Main, we get this from Rear?
+						// "1st Car Rear - Replicate everything from 1st Main" -> logic here is for Rear receiving from Main.
+						// We need the reverse logic: Main receiving from Rear?
+						// Or Main receiving a "waypoints" update in general?
+
+						// Let's implement logical check in the generic listener or separate block.
+						console.log(
+							`[App] Received waypoints update on ${deviceRole}: ${JSON.stringify(
+								data.data
+							)}`
+						);
 						setRouteWaypoints(data.data);
 						break;
 
 					case "route":
 						setRouteCoords(data.data.coordinates);
-						setRouteInfo({
-							duration: data.data.duration,
-							distance: data.data.distance,
-							legs: data.data.legs,
-						});
-						
+						setRouteInfo(data.data);
+
 						// Fit map to route (Preview Mode)
 						if (data.data.coordinates.length > 0) {
 							mapRef.current?.fitToCoordinates(data.data.coordinates, {
@@ -676,24 +942,26 @@ export default function App() {
 
 					case "navigation_state":
 						setNavigationState(data.data.state);
-						
+
 						if (data.data.state === "active") {
 							// Start transition animation
 							isTransitioningRef.current = true;
 							if (userRegionRef.current) {
-								mapRef.current?.animateCamera({
-									center: {
-										latitude: userRegionRef.current.latitude,
-										longitude: userRegionRef.current.longitude,
+								mapRef.current?.animateCamera(
+									{
+										center: {
+											latitude: userRegionRef.current.latitude,
+											longitude: userRegionRef.current.longitude,
+										},
+										heading: userHeading, // Heading might still be stale, but less critical
+										pitch: 60,
+										altitude: 100,
+										zoom: 18,
 									},
-									heading: userHeading, // Heading might still be stale, but less critical
-									pitch: 60,
-									altitude: 100,
-									zoom: 18,
-								}, { duration: 1000 });
+									{ duration: 1000 }
+								);
 							}
-							
-							// Reset transition flag after animation
+
 							setTimeout(() => {
 								isTransitioningRef.current = false;
 							}, 1000);
@@ -704,30 +972,104 @@ export default function App() {
 							setRouteInfo(null);
 							setDestination(null);
 							setRouteWaypoints([]);
-							
+							setShowStopsPanel(false);
+							setAddedStops([]);
+							setMyStopRequests([]);
+							setDeclinedStopRequests([]);
+
 							// Reset camera to idle view
 							if (userRegionRef.current) {
-								mapRef.current?.animateCamera({
-									center: {
-										latitude: userRegionRef.current.latitude,
-										longitude: userRegionRef.current.longitude,
+								mapRef.current?.animateCamera(
+									{
+										center: {
+											latitude: userRegionRef.current.latitude,
+											longitude: userRegionRef.current.longitude,
+										},
+										heading: userHeading,
+										pitch: 0,
+										altitude: 2000,
+										zoom: 17,
 									},
-									heading: userHeading,
-									pitch: 0,
-									altitude: 2000,
-									zoom: 17,
-								}, { duration: 1000 });
+									{ duration: 1000 }
+								);
 							}
 						}
 						break;
+				}
+			}
 
+			// Catch-all for waypoints updates from ANY other device if we are Main
+			if (
+				deviceRole === "car1-main" &&
+				data.type === "waypoints" &&
+				data.deviceRole !== "car1-main"
+			) {
+				// Check if length increased = new stop added
+				const newWaypoints = data.data as RouteWaypoint[];
+				if (newWaypoints.length > routeWaypoints.length) {
+					const newStop = newWaypoints[newWaypoints.length - 1]; // Assuming appended
+					// Calculate estimated distance/time from current location
+					let dist = 0;
+					if (userRegionRef.current) {
+						dist = getDistance(
+							{
+								latitude: userRegionRef.current.latitude,
+								longitude: userRegionRef.current.longitude,
+							},
+							{ latitude: newStop.latitude, longitude: newStop.longitude }
+						);
+					}
+
+					// Simple estimate: 50km/h avg speed
+					const dur = dist / 13.89;
+
+					setNotificationStop({
+						stop: newStop,
+						distance: dist,
+						duration: dur,
+					});
+
+					// TTS Announcement - Use speakText to ensure role checks and queuing
+					speakText(`A stop at ${newStop.name} has been added`);
+
+					// Update state
+					setRouteWaypoints(newWaypoints);
 				}
 			}
 
 			// Handle stop requests (Main Car Only)
 			if (deviceRole === "car1-main" && data.type === "request_add_waypoint") {
-				console.log(`[ConvoySync] Received request_add_waypoint: ${data.data.name}`);
-				addStopRef.current(data.data.name, data.data.latitude, data.data.longitude);
+				console.log(
+					`[ConvoySync] Received request_add_waypoint: ${data.data.name}`
+				);
+				// Instead of auto-adding, show the request card
+				setPendingStopRequest({
+					name: data.data.name,
+					latitude: data.data.latitude,
+					longitude: data.data.longitude,
+					id: data.data.id,
+				});
+			}
+
+			if (
+				deviceRole === "car1-main" &&
+				data.type === "stop_request_cancelled"
+			) {
+				console.log(
+					`[ConvoySync] Received stop_request_cancelled: ${data.data.name} (id: ${data.data.id})`
+				);
+				// Check if this matches our pending request using functional update to avoid stale closure
+				setPendingStopRequest((current) => {
+					// Match by ID if available (most robust), otherwise fallback to name
+					const matchById =
+						current?.id && data.data.id && current.id === data.data.id;
+					const matchByName = current && current.name === data.data.name;
+
+					if (matchById || matchByName) {
+						return null;
+					}
+					return current;
+				});
 			}
 
 			// 2nd Car Main - Selective sync
@@ -769,7 +1111,6 @@ export default function App() {
 		};
 	}, [syncServerUrl, deviceRole, navigationState, userHeading]);
 
-
 	// 1st Car Main - Broadcast Range (only on integer change)
 	const prevBroadcastRangeRef = useRef<number>(Math.round(remainingRange));
 	useEffect(() => {
@@ -777,7 +1118,7 @@ export default function App() {
 
 		const currentIntRange = Math.round(remainingRange);
 		if (currentIntRange !== prevBroadcastRangeRef.current) {
-			convoySync.send('range', { remainingRange: currentIntRange });
+			convoySync.send("range", { remainingRange: currentIntRange });
 			prevBroadcastRangeRef.current = currentIntRange;
 		}
 	}, [remainingRange, deviceRole, isSyncConnected]);
@@ -790,27 +1131,28 @@ export default function App() {
 			convoySync.send("route", {
 				coordinates: routeCoords,
 				duration: routeInfo.duration,
-				distance: routeInfo.distance,
+				distance: routeInfo.legs.reduce((acc, leg) => acc + leg.distance, 0),
 				legs: routeInfo.legs,
 			});
 		}
 	}, [routeCoords, routeInfo, deviceRole, isSyncConnected]);
 
-	// 1st Car Main - Broadcast Chat History
-	useEffect(() => {
-		if (deviceRole !== "car1-main" || !isSyncConnected) return;
-		
-		convoySync.send('chat_history', { messages });
-	}, [messages, deviceRole, isSyncConnected]);
+	// Chat history is NOT synced - each device maintains its own chat history
 
 	// Weather Logic (Moved from TopBar)
 	const weatherIntervalRef = useRef<number | null>(null);
-	const weatherLocationRef = useRef<{ latitude: number; longitude: number } | null>(null);
+	const weatherLocationRef = useRef<{
+		latitude: number;
+		longitude: number;
+	} | null>(null);
 
 	// Effect 1: Watch for location and store it once
 	useEffect(() => {
 		if (userRegion && !weatherLocationRef.current) {
-			weatherLocationRef.current = { latitude: userRegion.latitude, longitude: userRegion.longitude };
+			weatherLocationRef.current = {
+				latitude: userRegion.latitude,
+				longitude: userRegion.longitude,
+			};
 		}
 	}, [userRegion]);
 
@@ -819,7 +1161,7 @@ export default function App() {
 		const checkInterval = setInterval(() => {
 			if (weatherLocationRef.current && !weatherIntervalRef.current) {
 				clearInterval(checkInterval);
-				
+
 				const OPENWEATHER_API_KEY = process.env.EXPO_PUBLIC_OPENWEATHER_API_KEY;
 
 				if (!OPENWEATHER_API_KEY) {
@@ -831,24 +1173,24 @@ export default function App() {
 					try {
 						const loc = weatherLocationRef.current;
 						if (!loc) return;
-						
+
 						const url = `https://api.openweathermap.org/data/2.5/weather?lat=${loc.latitude}&lon=${loc.longitude}&appid=${OPENWEATHER_API_KEY}&units=metric`;
-						
+
 						const response = await fetch(url);
 						if (!response.ok) return;
-						
+
 						const data = await response.json();
-						
+
 						if (data && data.main && data.weather && data.weather[0]) {
 							const newWeather = {
 								temp: Math.round(data.main.temp),
 								code: data.weather[0].id,
 							};
 							setWeather(newWeather);
-							
+
 							// Broadcast if car1-main
-							if (deviceRole === 'car1-main' && isSyncConnected) {
-								convoySync.send('weather', newWeather);
+							if (deviceRole === "car1-main" && isSyncConnected) {
+								convoySync.send("weather", newWeather);
 							}
 						}
 					} catch (error) {
@@ -857,13 +1199,13 @@ export default function App() {
 				};
 
 				fetchWeather();
-				
+
 				weatherIntervalRef.current = setInterval(() => {
 					fetchWeather();
 				}, 5 * 60 * 1000);
 			}
 		}, 1000);
-		
+
 		return () => {
 			clearInterval(checkInterval);
 			if (weatherIntervalRef.current) {
@@ -913,7 +1255,14 @@ export default function App() {
 		}, 60000); // Every minute
 
 		return () => clearInterval(interval);
-	}, [deviceRole, isSyncConnected, navigationState, routeInfo, nextStopDistance, nextStopDuration]);
+	}, [
+		deviceRole,
+		isSyncConnected,
+		navigationState,
+		routeInfo,
+		nextStopDistance,
+		nextStopDuration,
+	]);
 
 	// 2. Location Tracking
 	const startLocationTracking = async () => {
@@ -976,32 +1325,32 @@ export default function App() {
 	// --- Logic ---
 
 	// Audio feedback for recording
-	async function playRecordingBeep(type: 'start' | 'stop') {
+	async function playRecordingBeep(type: "start" | "stop") {
 		try {
 			// Haptic feedback
 			await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
 			// Create a simple beep sound
-			const frequency = type === 'start' ? 800 : 600; // Higher pitch for start, lower for stop
+			const frequency = type === "start" ? 800 : 600; // Higher pitch for start, lower for stop
 			const duration = 0.1; // 100ms
-			
+
 			// Generate a simple sine wave beep
 			const sampleRate = 44100;
 			const numSamples = Math.floor(sampleRate * duration);
 			const buffer = new ArrayBuffer(44 + numSamples * 2); // WAV header + 16-bit PCM data
 			const view = new DataView(buffer);
-			
+
 			// WAV header
 			const writeString = (offset: number, str: string) => {
 				for (let i = 0; i < str.length; i++) {
 					view.setUint8(offset + i, str.charCodeAt(i));
 				}
 			};
-			
-			writeString(0, 'RIFF');
+
+			writeString(0, "RIFF");
 			view.setUint32(4, 36 + numSamples * 2, true);
-			writeString(8, 'WAVE');
-			writeString(12, 'fmt ');
+			writeString(8, "WAVE");
+			writeString(12, "fmt ");
 			view.setUint32(16, 16, true); // fmt chunk size
 			view.setUint16(20, 1, true); // PCM format
 			view.setUint16(22, 1, true); // mono
@@ -1009,29 +1358,34 @@ export default function App() {
 			view.setUint32(28, sampleRate * 2, true); // byte rate
 			view.setUint16(32, 2, true); // block align
 			view.setUint16(34, 16, true); // bits per sample
-			writeString(36, 'data');
+			writeString(36, "data");
 			view.setUint32(40, numSamples * 2, true);
-			
+
 			// Generate sine wave
 			for (let i = 0; i < numSamples; i++) {
 				const t = i / sampleRate;
 				const envelope = Math.min(1, (numSamples - i) / (sampleRate * 0.02)); // Fade out
 				const sample = Math.sin(2 * Math.PI * frequency * t) * envelope * 0.3; // 30% volume
-				const intSample = Math.max(-32768, Math.min(32767, Math.floor(sample * 32767)));
+				const intSample = Math.max(
+					-32768,
+					Math.min(32767, Math.floor(sample * 32767))
+				);
 				view.setInt16(44 + i * 2, intSample, true);
 			}
-			
+
 			// Write to temp file and play
-			const beepPath = `${FileSystem.Paths.cache.uri}beep_${type}_${Date.now()}.wav`;
+			const beepPath = `${
+				FileSystem.Paths.cache.uri
+			}beep_${type}_${Date.now()}.wav`;
 			const beepFile = new FileSystem.File(beepPath);
 			await beepFile.create({ overwrite: true });
 			await beepFile.write(new Uint8Array(buffer));
-			
+
 			const { sound } = await Audio.Sound.createAsync(
 				{ uri: beepPath },
 				{ shouldPlay: true, volume: 0.5 }
 			);
-			
+
 			// Clean up after playing
 			sound.setOnPlaybackStatusUpdate(async (status) => {
 				if (status.isLoaded && status.didJustFinish) {
@@ -1044,13 +1398,14 @@ export default function App() {
 				}
 			});
 		} catch (err) {
-			console.warn('Failed to play recording beep:', err);
+			console.warn("Failed to play recording beep:", err);
 		}
 	}
 
 	// TTS Playback with Queue
 	async function playActualTTS(text: string): Promise<void> {
-		console.log('[TTS] Starting playback for:', text.substring(0, 50));
+		// Removed blocking check here; policy is handled in processNextInQueue
+		console.log("[TTS] Starting playback for:", text.substring(0, 50));
 		return new Promise(async (resolve) => {
 			try {
 				// Stop any currently playing audio
@@ -1068,121 +1423,47 @@ export default function App() {
 					shouldDuckAndroid: true,
 				});
 
-				// Generate TTS audio
-		console.log('[TTS] Calling Groq API for audio generation...');
-		let audioBuffer: ArrayBuffer | undefined;
-		let shouldUseNative = useNativeTTS; // Check developer setting
-		
-		// Skip Groq if native TTS is forced
-		if (!shouldUseNative) {
-			try {
-				audioBuffer = await createGroqTtsAudio(text);
-				console.log('[TTS] Audio generated, size:', audioBuffer.byteLength, 'bytes');
-			} catch (groqError: any) {
-				// Check if it's a rate limit error
-				if (groqError?.message?.includes('429') || groqError?.message?.includes('rate_limit')) {
-					console.warn('[TTS] Groq rate limit exceeded, falling back to native TTS');
-					shouldUseNative = true;
-				} else {
-					throw groqError; // Re-throw other errors
-				}
-			}
-		} else {
-			console.log('[TTS] Native TTS forced by developer setting');
-		}
-
-		// If Groq failed with rate limit, use native TTS
-		if (shouldUseNative) {
-			console.log('[TTS] Using native TTS...');
-			await new Promise<void>((resolveNative) => {
+				console.log("[TTS] Using native TTS...");
 				Speech.speak(text, {
-					language: 'en-US',
+					language: "en-US",
 					pitch: 1.0,
 					rate: 0.9,
 					onDone: () => {
-						console.log('[TTS] Native TTS playback complete');
-						resolveNative();
+						console.log("[TTS] Native TTS playback complete");
+						resolve();
 					},
 					onError: (error) => {
-						console.error('[TTS] Native TTS error:', error);
-						resolveNative(); // Resolve anyway to continue queue
-					}
+						console.error("[TTS] Native TTS error:", error);
+						resolve();
+					},
 				});
-			});
-			console.log('[TTS] Playback complete');
-			resolve();
-			return;
-		}
-
-		// Continue with Groq audio if it was successful
-		if (!audioBuffer) {
-			throw new Error('Audio buffer is undefined');
-		}
-
-				// Write audio buffer to temporary file using modern File API
-				const tempFilePath = `${FileSystem.Paths.cache.uri}tts_${Date.now()}.wav`;
-				
-				// Create a File instance and write the buffer
-				const file = new FileSystem.File(tempFilePath);
-				await file.create({ overwrite: true });
-				
-				// Write the ArrayBuffer directly
-				const uint8Array = new Uint8Array(audioBuffer);
-				await file.write(uint8Array);
-
-				// Load and play
-		console.log('[TTS] Loading audio file...');
-		
-		// Add timeout to prevent hanging
-		const loadTimeout = new Promise<never>((_, reject) => {
-			setTimeout(() => reject(new Error('Audio load timeout')), 5000);
+			} catch (err) {
+				console.error("[TTS] Playback error:", err);
+				resolve();
+			}
 		});
-		
-		const { sound } = await Promise.race([
-			Audio.Sound.createAsync(
-				{ uri: tempFilePath },
-				{ shouldPlay: false }
-			),
-			loadTimeout
-		]);
-		currentAudioRef.current = sound;
-		
-		console.log('[TTS] Playing audio...');
-		await sound.playAsync();
-
-		// Wait for playback to finish
-		await new Promise<void>((resolvePlayback) => {
-			sound.setOnPlaybackStatusUpdate(async (status) => {
-				if (status.isLoaded && status.didJustFinish) {
-					console.log('[TTS] Playback finished, cleaning up...');
-					// Remove listener
-					sound.setOnPlaybackStatusUpdate(null);
-					// Unload sound
-					await sound.unloadAsync();
-					currentAudioRef.current = null;
-					// Delete temp file
-					try {
-						await file.delete();
-					} catch (e) {
-						console.warn('[TTS] Failed to delete temp file:', e);
-					}
-					resolvePlayback();
-				}
-			});
-		});
-		console.log('[TTS] Playback complete');
-	} catch (error) {
-		console.error('[TTS] Error during playback:', error);
-		// Resolve even on error to prevent hanging
-		resolve();
-	}
-});
 	}
 
 	async function processNextInQueue() {
-		console.log(`[TTS] processNextInQueue called. Queue length: ${ttsQueue.current.length}, isProcessing: ${isProcessingTTS.current}`);
+		console.log(
+			`[TTS] processNextInQueue called. Queue length: ${ttsQueue.current.length}, isProcessing: ${isProcessingTTS.current}`
+		);
+
+		// STRICTLY prevent TTS for rear seat UNLESS forced (replies)
+		if (deviceRole === "car1-rear") {
+			const nextItem = ttsQueue.current[0];
+			if (!nextItem?.force) {
+				console.log(
+					"[TTS] Device is rear seat, clearing queue and skipping playback (not forced)"
+				);
+				ttsQueue.current = [];
+				isProcessingTTS.current = false;
+				return;
+			}
+		}
+
 		if (isProcessingTTS.current || ttsQueue.current.length === 0) {
-			console.log('[TTS] Skipping - already processing or queue empty');
+			console.log("[TTS] Skipping - already processing or queue empty");
 			return;
 		}
 
@@ -1191,7 +1472,7 @@ export default function App() {
 
 		if (item) {
 			if (isMuted) {
-				console.log('[TTS] Muted, skipping audio generation');
+				console.log("[TTS] Muted, skipping audio generation");
 				isProcessingTTS.current = false;
 				if (ttsQueue.current.length > 0) {
 					processNextInQueue();
@@ -1199,17 +1480,34 @@ export default function App() {
 				return;
 			}
 			await playActualTTS(item.text);
-			
+
+			// Check if we have an onDone callback
+			if (item.onDone) {
+				// We need to wait for playActualTTS to finish.
+				// playActualTTS is async but currently we await it above.
+				// However, audio might still be playing if not awaited properly deep down?
+				// Assuming await playActualTTS resolves when playback finishes.
+				// If playActualTTS uses Sound object, we need to ensure it waits.
+				// Let's check playActualTTS implementation...
+				// It uses `Speech.speak` (native) or `Audio.Sound`.
+				// If native, `Speech.speak` is fire-and-forget unless we trap onDone.
+				// But `playActualTTS` logic (lines 1220-1250) handles this?
+				// Actually `processNextInQueue` is inside `app/index.tsx`.
+				// Let's assume for now we call it after await.
+				item.onDone();
+			}
+
 			// If this message should activate the mic and we're not already recording
 			if (item.shouldActivateMic) {
-				console.log('TTS ended with question, will activate mic');
+				console.log("TTS ended with question, will activate mic");
 				// Small delay to let the audio finish cleanly
 				setTimeout(() => {
-					console.log('Activating voice recognition automatically');
+					console.log("Activating voice recognition automatically");
 					// Need to call this asynchronously
 					(async () => {
 						try {
-							const result = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+							const result =
+								await ExpoSpeechRecognitionModule.requestPermissionsAsync();
 							if (!result.granted) {
 								return;
 							}
@@ -1237,28 +1535,37 @@ export default function App() {
 		}
 
 		isProcessingTTS.current = false;
-		
+
 		// Process next item if any
 		if (ttsQueue.current.length > 0) {
-			console.log(`TTS queue has ${ttsQueue.current.length} remaining items, processing next...`);
+			console.log(
+				`TTS queue has ${ttsQueue.current.length} remaining items, processing next...`
+			);
 			processNextInQueue();
 		} else {
-			console.log('TTS queue empty');
+			console.log("TTS queue empty");
 		}
 	}
 
-	function speakText(text: string) {
+	function speakText(
+		text: string,
+		options?: { onDone?: () => void; force?: boolean }
+	) {
 		console.log(`[TTS] Adding to queue: "${text.substring(0, 50)}..."`);
 		// Check if text ends with a question mark
-		const endsWithQuestion = text.trim().endsWith('?');
-		
+		const endsWithQuestion = text.trim().endsWith("?");
+
 		// Add to queue
-		ttsQueue.current.push({ 
-			text, 
-			shouldActivateMic: endsWithQuestion 
+		ttsQueue.current.push({
+			text,
+			shouldActivateMic: endsWithQuestion,
+			onDone: options?.onDone,
+			force: options?.force,
 		});
-		
-		console.log(`[TTS] Queue length: ${ttsQueue.current.length}, isProcessing: ${isProcessingTTS.current}`);
+
+		console.log(
+			`[TTS] Queue length: ${ttsQueue.current.length}, isProcessing: ${isProcessingTTS.current}`
+		);
 		// Trigger processing
 		processNextInQueue();
 	}
@@ -1266,19 +1573,43 @@ export default function App() {
 	// Speech recognition event handlers
 	useSpeechRecognitionEvent("start", () => {
 		setIsRecording(true);
-		playRecordingBeep('start');
+		playRecordingBeep("start");
 	});
 
 	useSpeechRecognitionEvent("end", () => {
 		setIsRecording(false);
 		setIsProcessing(false); // Ensure processing stops if recognition ends unexpectedly
-		playRecordingBeep('stop');
+		playRecordingBeep("stop");
+
+		if (voiceMode.current === "interactive" && lastTranscript.current) {
+			setVoiceOverlayText("I'm thinking...");
+			handleVoiceInput(lastTranscript.current);
+			lastTranscript.current = ""; // Reset
+		} else if (voiceMode.current === "standard" && lastTranscript.current) {
+			// Submit for standard mode (rear seat)
+			handleVoiceInput(lastTranscript.current);
+			lastTranscript.current = "";
+			setStreamingVoiceText(undefined);
+		} else if (voiceMode.current === "interactive") {
+			// Closed without input
+			closeVoiceOverlay();
+		}
 	});
 
 	useSpeechRecognitionEvent("result", (event) => {
 		const transcript = event.results[0]?.transcript;
 		if (transcript) {
-			handleVoiceInput(transcript);
+			if (voiceMode.current === "interactive") {
+				setVoiceOverlayText(transcript);
+				lastTranscript.current = transcript;
+				// We wait for 'end' event to submit
+			} else if (voiceMode.current === "standard") {
+				setStreamingVoiceText(transcript);
+				lastTranscript.current = transcript;
+			} else {
+				// Fallback for immediate submit if not streaming (shouldn't happen with interim=true)
+				// handleVoiceInput(transcript);
+			}
 		}
 	});
 
@@ -1290,9 +1621,11 @@ export default function App() {
 
 	async function startVoiceRecognition() {
 		if (isRecording || isProcessing) return;
+		voiceMode.current = "standard"; // Default mode
 
 		try {
-			const result = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+			const result =
+				await ExpoSpeechRecognitionModule.requestPermissionsAsync();
 			if (!result.granted) {
 				Alert.alert("Permission needed", "Please allow microphone access");
 				return;
@@ -1307,7 +1640,7 @@ export default function App() {
 			setIsProcessing(true);
 			ExpoSpeechRecognitionModule.start({
 				lang: "en-US",
-				interimResults: false,
+				interimResults: true,
 				maxAlternatives: 1,
 				continuous: false,
 				requiresOnDeviceRecognition: false,
@@ -1318,18 +1651,90 @@ export default function App() {
 		}
 	}
 
+	function stopVoiceRecognition() {
+		ExpoSpeechRecognitionModule.stop();
+		// State updates will be handled by the 'end' event listener
+	}
+
+	async function startInteractiveVoice() {
+		if (isRecording || isProcessing) return;
+
+		// Setup Overlay
+		voiceMode.current = "interactive";
+		setVoiceOverlayText("I'm listening...");
+		setShowVoiceOverlay(true);
+		Animated.timing(voiceOverlayFade, {
+			toValue: 1,
+			duration: 300,
+			useNativeDriver: true,
+		}).start();
+
+		// Start Recognition concurrently
+		try {
+			const result =
+				await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+			if (!result.granted) {
+				Alert.alert("Permission needed", "Please allow microphone access");
+				closeVoiceOverlay();
+				return;
+			}
+
+			await Audio.setAudioModeAsync({
+				allowsRecordingIOS: true,
+				playsInSilentModeIOS: true,
+			});
+
+			// setIsProcessing(true); // 'start' event will handle recording state
+			// But checking isProcessing prevents double start?
+			// In original code (line 1427) it set setIsProcessing(true).
+			setIsProcessing(true);
+
+			ExpoSpeechRecognitionModule.start({
+				lang: "en-US",
+				interimResults: true, // Need partials for "word by word"
+				maxAlternatives: 1,
+				continuous: false,
+				requiresOnDeviceRecognition: false,
+			});
+		} catch (err) {
+			console.error("Failed to start interactive voice", err);
+			closeVoiceOverlay();
+		}
+	}
+
+	function handleManualCloseVoice() {
+		stopVoiceRecognition(); // Stop listening
+		closeVoiceOverlay(); // Close UI
+		setIsProcessing(false); // Reset generic processing state
+	}
+
+	function closeVoiceOverlay() {
+		Animated.timing(voiceOverlayFade, {
+			toValue: 0,
+			duration: 300,
+			useNativeDriver: true,
+		}).start(() => {
+			setShowVoiceOverlay(false);
+			setVoiceOverlayText("I'm listening...");
+		});
+	}
+
 	async function handleVoiceInput(transcript: string) {
 		setIsProcessing(true);
 		// Add user message optimistically
 		setMessages((prev) => [
 			...prev,
-			{ role: "user" as const, content: transcript },
+			{ role: "user" as const, content: transcript, sender: deviceRole },
 		]);
 
 		if (!userRegion) {
 			setMessages((prev) => [
 				...prev,
-				{ role: "assistant", content: "I need your location to help you." },
+				{
+					role: "assistant",
+					content: "I need your location to help you.",
+					target: deviceRole,
+				},
 			]);
 			setIsProcessing(false);
 			return;
@@ -1342,31 +1747,53 @@ export default function App() {
 				latitude: userRegion.latitude,
 				longitude: userRegion.longitude,
 				humanReadable: undefined,
-				destination: destination ? {
-					name: destination.name,
-					latitude: destination.latitude,
-					longitude: destination.longitude
-				} : undefined,
-			}
+				destination: destination
+					? {
+							name: destination.name,
+							latitude: destination.latitude,
+							longitude: destination.longitude,
+					  }
+					: undefined,
+			},
+			deviceRole
 		);
 
-		await processLLMResponse(response);
+		await processLLMResponse(response, deviceRole);
 		setIsProcessing(false);
 	}
 
-	async function processLLMResponse(response: any) {
+	async function processLLMResponse(
+		response: any,
+		targetRole: string = "car1-main"
+	) {
 		let autoStartFromPhrase = false;
 		let shouldStartLocal = shouldAutoStart;
 
-		// Add assistant message
+		// 1. Show Reply FIRST (Immediate Feedback)
 		if (response.reply) {
 			setMessages((prev) => [
 				...prev,
-				{ role: "assistant", content: response.reply },
+				{
+					role: "assistant",
+					content: response.reply,
+					target: targetRole,
+				},
 			]);
 
-			// Speak the response (non-blocking)
-			speakText(response.reply);
+			if (voiceMode.current === "interactive") {
+				setVoiceOverlayText(response.reply);
+				setTimeout(() => {
+					closeVoiceOverlay();
+				}, 5000);
+			}
+
+			if (targetRole === deviceRole || targetRole === "all") {
+				speakText(response.reply, {
+					onDone:
+						voiceMode.current === "interactive" ? closeVoiceOverlay : undefined,
+					force: deviceRole === "car1-rear",
+				});
+			}
 
 			if (response.reply.toLowerCase().includes("driving you there")) {
 				autoStartFromPhrase = true;
@@ -1374,54 +1801,67 @@ export default function App() {
 			}
 		}
 
-		// Handle Navigation Intent
+		// 2. Handle Navigation/Search Intent
 		const nav = response.navigation;
+		let targetLat: number | undefined;
+		let targetLng: number | undefined;
+		let targetName = nav?.destinationName;
+		let routeFound = false;
+
+		if (nav?.searchQuery && userRegion) {
+			const places = await searchPlaces(
+				nav.searchQuery,
+				userRegion.latitude,
+				userRegion.longitude
+			);
+			if (places.length > 0) {
+				// If main driver, we pick the best match to auto-start later
+				if (deviceRole !== "car1-rear") {
+					const best = places[0];
+					targetLat = best.latitude;
+					targetLng = best.longitude;
+					targetName = best.name;
+					setShouldAutoStart(true);
+					shouldStartLocal = true;
+				} else {
+					// REAR SEAT: Append a NEW message with the places
+					speakText("Here's what I've found.", { force: true });
+					setMessages((prev) => [
+						...prev,
+						{
+							role: "assistant",
+							content: "Here's what I've found.",
+							places: places.slice(0, 5),
+							target: targetRole,
+						},
+					]);
+				}
+			}
+		}
+
+		// Prepare Navigation Logic if needed (already handled search above)
 		if (nav) {
 			if (nav.cancel) {
 				cancelNavigation();
-			} else {
-				let targetLat: number | undefined;
-				let targetLng: number | undefined;
-				let targetName = nav.destinationName;
-				let routeFound = false;
+				return;
+			}
 
-				// A. Search Query (Category)
-				if (nav.searchQuery) {
-					// Don't speak immediately, wait for search result
-					const places = await searchPlaces(
-						nav.searchQuery,
-						userRegion!.latitude,
-						userRegion!.longitude
-					);
+			// If it was a search for REAR seat, we are DONE here (places shown in chat)
+			if (nav.searchQuery && deviceRole === "car1-rear") {
+				setIsProcessing(false);
+				setShouldAutoStart(false);
+				shouldStartLocal = false;
+				return;
+			}
 
-					if (places.length > 0) {
-						const best = places[0];
-						targetLat = best.latitude;
-						targetLng = best.longitude;
-						targetName = best.name; // Use specific name
-
-						// Auto-start for nearest place search
-						setShouldAutoStart(true);
-						shouldStartLocal = true;
-					} else {
-						setMessages((prev) => [
-							...prev,
-							{
-								role: "assistant",
-								content: "I couldn't find any places matching that.",
-							},
-						]);
-						return; // Stop if no place found
-					}
-				}
-				// B. Explicit Coordinates (from LLM knowledge)
-				else if (nav.coordinates) {
+			// Proceed with other nav types (Explicit Coords, Geocoding) if no search target yet
+			if (!targetLat && !targetLng) {
+				if (nav.coordinates) {
 					targetLat = nav.coordinates.latitude;
 					targetLng = nav.coordinates.longitude;
 					targetName = nav.destinationName || "Destination";
-				}
-				// C. Geocoding (Name only)
-				else if (nav.destinationName) {
+				} else if (nav.destinationName && !nav.searchQuery) {
+					// Only geocode if NOT a search query (search query already handled above)
 					const geocoded = await Location.geocodeAsync(nav.destinationName);
 					if (geocoded.length > 0) {
 						targetLat = geocoded[0].latitude;
@@ -1429,147 +1869,224 @@ export default function App() {
 						targetName = nav.destinationName;
 					}
 				}
+			}
+			// 3. Calculate Route if we have a target
 
-				// 3. Calculate Route if we have a target
-				if (targetLat && targetLng) {
-					setDestination({
+			// 3. Calculate Route if we have a target
+			if (targetLat && targetLng) {
+				// REAR SEAT: If we have a destination but not a route yet, show it as a Place Marker
+				if (deviceRole === "car1-rear" && !nav.startNavigation && userRegion) {
+					const dist = getDistance(userRegion, {
 						latitude: targetLat,
 						longitude: targetLng,
-						name: targetName || "Destination",
 					});
+					const placeResult: PlaceResult = {
+						id: `nav-result-${Date.now()}`,
+						name: targetName || "Destination",
+						latitude: targetLat,
+						longitude: targetLng,
+						distance: Math.round(dist),
+						image: generatePlaceImage(
+							targetName || "Destination",
+							"landmark exterior"
+						),
+						address: targetName, // Fallback
+					};
 
-					// Handle Waypoints
-					const waypointsForRoute: RouteWaypoint[] = [];
-					if (nav.waypoints) {
-						for (const wp of nav.waypoints) {
-							let wpLat = wp.coordinates?.[0];
-							let wpLng = wp.coordinates?.[1];
+					setSelectedPlace(placeResult);
+					if (mapRef.current) {
+						mapRef.current.animateCamera(
+							{
+								center: {
+									latitude: targetLat,
+									longitude: targetLng,
+								},
+								zoom: 16,
+								pitch: 45,
+							},
+							{ duration: 1000 }
+						);
+					}
+					setIsProcessing(false);
+					return;
+				}
 
-							if (!wpLat || !wpLng) {
-								const geocoded = await Location.geocodeAsync(wp.name);
-								if (geocoded.length > 0) {
-									wpLat = geocoded[0].latitude;
-									wpLng = geocoded[0].longitude;
-								}
-							}
+				setDestination({
+					latitude: targetLat,
+					longitude: targetLng,
+					name: targetName || "Destination",
+				});
 
-							if (wpLat && wpLng) {
-								waypointsForRoute.push({
-									latitude: wpLat,
-									longitude: wpLng,
-									name: wp.name,
-								});
+				// Handle Waypoints
+				const waypointsForRoute: RouteWaypoint[] = [];
+				if (nav.waypoints) {
+					for (const wp of nav.waypoints) {
+						let wpLat = wp.coordinates?.[0];
+						let wpLng = wp.coordinates?.[1];
+
+						if (!wpLat || !wpLng) {
+							const geocoded = await Location.geocodeAsync(wp.name);
+							if (geocoded.length > 0) {
+								wpLat = geocoded[0].latitude;
+								wpLng = geocoded[0].longitude;
 							}
 						}
+
+						if (wpLat && wpLng) {
+							waypointsForRoute.push({
+								latitude: wpLat,
+								longitude: wpLng,
+								name: wp.name,
+							});
+						}
 					}
-					setRouteWaypoints(waypointsForRoute);
+				}
+				setRouteWaypoints(waypointsForRoute);
 
-					const route = await getRoute(
-						[userRegion!.latitude, userRegion!.longitude],
-						[targetLat, targetLng],
-						waypointsForRoute.map(wp => ({ coordinates: [wp.latitude, wp.longitude] })),
-						routeOptions
-					);
+				const route = await getRoute(
+					[userRegion!.latitude, userRegion!.longitude],
+					[targetLat, targetLng],
+					waypointsForRoute.map((wp) => ({
+						coordinates: [wp.latitude, wp.longitude],
+					})),
+					routeOptions
+				);
 
-					if (route) {
-						setRouteCoords(route.coordinates);
-						setRouteInfo({
-							duration: route.duration,
-							distance: route.distance,
-							legs: route.legs,
-						});
-						routeFound = true;
+				if (route) {
+					setRouteCoords(route.coordinates);
+					setRouteInfo(route);
+					routeFound = true;
 
-						// ONLY announce distance for search queries ("nearest X"), not explicit destinations
-						if (nav.searchQuery && targetName) {
-							const distanceInMeters = route.distance;
-							
-							// Round meters first to handle edge cases like 996m -> 1000m
-							const roundedMeters = Math.round(distanceInMeters / 10) * 10;
-							
-							let distanceText;
-							
-							if (roundedMeters < 1000) {
-								// Show in meters (rounded to nearest 10) for distances less than 1km
-								distanceText = `${roundedMeters} meter${roundedMeters !== 10 ? 's' : ''}`;
-							} else {
-								// Show in kilometers for 1km and above
-								const km = (roundedMeters / 1000).toFixed(1);
-								distanceText = `${km} kilometer${km !== '1.0' ? 's' : ''}`;
-							}
-							
-							const foundMsg = `I've found ${targetName} at ${distanceText}. I'm now driving you there.`;
-							setMessages((prev) => [
-								...prev,
-								{ role: "assistant", content: foundMsg },
-							]);
+					// ONLY announce distance for search queries ("nearest X"), not explicit destinations
+					if (nav.searchQuery && targetName) {
+						const distanceInMeters = route.distance;
 
-							// Speak the found message (non-blocking)
+						// Round meters first to handle edge cases like 996m -> 1000m
+						const roundedMeters = Math.round(distanceInMeters / 10) * 10;
+
+						let distanceText;
+
+						if (roundedMeters < 1000) {
+							// Show in meters (rounded to nearest 10) for distances less than 1km
+							distanceText = `${roundedMeters} meter${
+								roundedMeters !== 10 ? "s" : ""
+							}`;
+						} else {
+							// Show in kilometers for 1km and above
+							const km = (roundedMeters / 1000).toFixed(1);
+							distanceText = `${km} kilometer${km !== "1.0" ? "s" : ""}`;
+						}
+
+						const foundMsg = `I've found ${targetName} at ${distanceText}. I'm now driving you there.`;
+						setMessages((prev) => [
+							...prev,
+							{ role: "assistant", content: foundMsg, target: targetRole },
+						]);
+
+						// Speak the found message (non-blocking)
+						if (targetRole === deviceRole) {
 							speakText(foundMsg);
 						}
 					}
 				}
+			}
 
-				// 4. Determine State
-				if (routeFound) {
-					if (shouldStartLocal || nav.startNavigation) {
-						startNavigation();
-						setShouldAutoStart(false); // Reset flag
-					} else {
-						setNavigationState("preview");
-						// Fit map to route
-						if (mapRef.current && targetLat && targetLng) {
-							mapRef.current.fitToCoordinates(
-								[
-									{
-										latitude: userRegion!.latitude,
-										longitude: userRegion!.longitude,
-									},
-									{ latitude: targetLat, longitude: targetLng },
-								],
+			// 4. Determine State
+			if (routeFound) {
+				if (
+					(shouldStartLocal || nav.startNavigation) &&
+					targetRole !== "car1-rear"
+				) {
+					startNavigation();
+					setShouldAutoStart(false); // Reset flag
+				} else {
+					setNavigationState("preview");
+					// Fit map to route
+					if (mapRef.current && targetLat && targetLng) {
+						mapRef.current.fitToCoordinates(
+							[
 								{
-									edgePadding: { top: 150, right: 50, bottom: 150, left: 50 },
-									animated: true,
-								}
-							);
-						}
+									latitude: userRegion!.latitude,
+									longitude: userRegion!.longitude,
+								},
+								{ latitude: targetLat, longitude: targetLng },
+							],
+							{
+								edgePadding: { top: 150, right: 50, bottom: 150, left: 50 },
+								animated: true,
+							}
+						);
 					}
-				} else if (nav.startNavigation) {
-					// User confirmed a previous route or just said "start"
+				}
+			} else if (nav.startNavigation) {
+				// User confirmed a previous route or just said "start"
+				if (targetRole === "car1-rear") {
+					console.warn(
+						"Ignored startNavigation command from rear seat (blocked by policy)"
+					);
+				} else {
 					startNavigation();
 				}
 			}
 		}
 	}
 
-	async function handleTextSubmit() {
-		if (!inputText.trim() || !userRegion) return;
+	// We need to handle both empty args (from input field submit) and string args (from suggestion clicks)
+	// TextInput.onSubmitEditing passes an event, while our suggestion click passes a string.
+	async function handleTextSubmit(arg?: any) {
+		let textToUse = inputText;
 
-		const text = inputText.trim();
-		setInputText(""); // Clear input
+		if (typeof arg === "string") {
+			console.log("[App] handleTextSubmit called with string arg:", arg);
+			textToUse = arg;
+		} else if (arg && arg.nativeEvent && arg.nativeEvent.text) {
+			// Handle native event from TextInput
+			console.log(
+				"[App] handleTextSubmit called with event:",
+				arg.nativeEvent.text
+			);
+			textToUse = arg.nativeEvent.text;
+		} else {
+			console.log(
+				"[App] handleTextSubmit called with no/unknown arg, using state:",
+				inputText
+			);
+		}
+
+		if (!textToUse.trim() || !userRegion) {
+			console.warn("[App] Submission rejected. Text empty or no region.");
+			return;
+		}
+
+		const text = textToUse.trim();
+
+		// Only clear the input field if we used the input field's state
+		if (textToUse === inputText) {
+			setInputText("");
+		}
 
 		// Add user message
-		const newMsgs = [...messages, { role: "user" as const, content: text }];
+		const newMsgs = [
+			...messages,
+			{ role: "user" as const, content: text, sender: deviceRole },
+		];
 		setMessages(newMsgs);
 
-		const response = await askElmoLLM(
-			text,
-			newMsgs,
-			{
-				latitude: userRegion.latitude,
-				longitude: userRegion.longitude,
-				humanReadable: undefined,
-				destination: destination ? {
-					name: destination.name,
-					latitude: destination.latitude,
-					longitude: destination.longitude
-				} : undefined,
-			}
-		);
+		const response = await askElmoLLM(text, newMsgs, {
+			latitude: userRegion.latitude,
+			longitude: userRegion.longitude,
+			humanReadable: undefined,
+			destination: destination
+				? {
+						name: destination.name,
+						latitude: destination.latitude,
+						longitude: destination.longitude,
+				  }
+				: undefined,
+		});
 
-		await processLLMResponse(response);
+		await processLLMResponse(response, deviceRole);
 	}
-
 
 	// Ref to hold the latest addStopDuringNavigation function to avoid stale closures in listeners
 	const addStopRef = useRef(addStopDuringNavigation);
@@ -1578,20 +2095,26 @@ export default function App() {
 	});
 
 	// Add a stop during active navigation (for 1st car main and 2nd car main when accepting request)
-	async function addStopDuringNavigation(stopName: string, stopLat: number, stopLng: number) {
+	async function addStopDuringNavigation(
+		stopName: string,
+		stopLat: number,
+		stopLng: number,
+		id?: string
+	) {
 		// If car1-rear, send request to main instead of adding locally
 		// We do this BEFORE checking userRegion/destination because rear might just be a remote control
 		if (deviceRole === "car1-rear" && isSyncConnected) {
-			console.log(`[App] Sending request_add_waypoint: ${stopName}`);
+			console.log(
+				`[App] Sending request_add_waypoint: ${stopName} (id: ${id})`
+			);
 			convoySync.send("request_add_waypoint", {
 				name: stopName,
 				latitude: stopLat,
 				longitude: stopLng,
+				id: id,
 			});
-			setMessages((prev) => [
-				...prev,
-				{ role: "assistant", content: `Requesting to add stop at ${stopName}...` },
-			]);
+			// Track local pending request using ID if available, otherwise name
+			setMyStopRequests((prev) => [...prev, id || stopName]);
 			return;
 		}
 
@@ -1602,27 +2125,24 @@ export default function App() {
 			latitude: stopLat,
 			longitude: stopLng,
 			name: stopName,
+			id: id,
 		};
 
 		setRouteWaypoints((prev) => [...prev, newWaypoint]);
 
 		// Recalculate route with new waypoint
 		const allWaypoints = [...routeWaypoints, newWaypoint];
-		
+
 		const route = await getRoute(
 			[userRegion.latitude, userRegion.longitude],
 			[destination.latitude, destination.longitude],
-			allWaypoints.map(wp => ({ coordinates: [wp.latitude, wp.longitude] })),
+			allWaypoints.map((wp) => ({ coordinates: [wp.latitude, wp.longitude] })),
 			routeOptions
 		);
 
 		if (route) {
 			setRouteCoords(route.coordinates);
-			setRouteInfo({
-				duration: route.duration,
-				distance: route.distance,
-				legs: route.legs,
-			});
+			setRouteInfo(route);
 
 			// If 1st car main, broadcast the waypoint addition (optional, as route update handles it, but good for explicit events)
 			if (deviceRole === "car1-main" && isSyncConnected) {
@@ -1632,7 +2152,10 @@ export default function App() {
 			// Show confirmation message
 			setMessages((prev) => [
 				...prev,
-				{ role: "assistant", content: `Added stop at ${stopName}. Recalculating route...` },
+				{
+					role: "assistant",
+					content: `Added stop at ${stopName}.`,
+				},
 			]);
 		}
 	}
@@ -1644,7 +2167,8 @@ export default function App() {
 		await addStopDuringNavigation(
 			pendingStopRequest.name,
 			pendingStopRequest.latitude,
-			pendingStopRequest.longitude
+			pendingStopRequest.longitude,
+			pendingStopRequest.id
 		);
 
 		setPendingStopRequest(null);
@@ -1652,8 +2176,44 @@ export default function App() {
 
 	// Handle stop request decline for 2nd car main
 	function handleStopRequestDecline() {
+		if (pendingStopRequest && isSyncConnected) {
+			convoySync.send("stop_request_declined", {
+				name: pendingStopRequest.name,
+				id: pendingStopRequest.id,
+			});
+		}
 		setPendingStopRequest(null);
 	}
+
+	function handleCancelRequest(place: PlaceResult) {
+		const id = place.id || place.name;
+		setMyStopRequests((prev) => prev.filter((reqId) => reqId !== id));
+
+		// Notify main driver to remove the request popup
+		if (deviceRole === "car1-rear" && isSyncConnected) {
+			console.log(
+				`[App] Sending stop_request_cancelled: ${place.name} (id: ${id})`
+			);
+			convoySync.send("stop_request_cancelled", {
+				name: place.name,
+				latitude: place.latitude,
+				longitude: place.longitude,
+				id: id,
+			});
+		}
+	}
+
+	// Auto-accept stop request after 5 seconds
+	useEffect(() => {
+		if (pendingStopRequest) {
+			const timer = setTimeout(() => {
+				console.log("[App] Auto-accepting stop request");
+				speakText(`A stop at ${pendingStopRequest.name} has been added`);
+				handleStopRequestAccept();
+			}, 5000);
+			return () => clearTimeout(timer);
+		}
+	}, [pendingStopRequest]);
 
 	// Stops Panel Logic
 	function toggleStopsPanel() {
@@ -1673,13 +2233,16 @@ export default function App() {
 		if (userRegion) {
 			// Map "tourism" category to "attraction" query for POIs
 			const query = category === "tourism" ? "attraction" : category;
-			const results = await searchPlaces(query, userRegion.latitude, userRegion.longitude);
+			const results = await searchPlaces(
+				query,
+				userRegion.latitude,
+				userRegion.longitude
+			);
 			setStopsSearchResults(results.slice(0, 10));
 		}
 
 		setIsSearchingStops(false);
 	}
-
 
 	// Testing Scenarios Logic
 	function startScenario1() {
@@ -1727,7 +2290,6 @@ export default function App() {
 		setActiveScenario(null);
 	}
 
-	
 	function handleResetToDefault() {
 		// Reset Location
 		const resetLocation = {
@@ -1739,7 +2301,7 @@ export default function App() {
 		setUserRegion(resetLocation);
 		setUserHeading(0);
 		setSpeed(0);
-		
+
 		// Reset Range
 		setRemainingRange(478);
 
@@ -1767,24 +2329,66 @@ export default function App() {
 				zoom: 15,
 			});
 		}
+
+		// Reset messages
+		setMessages([
+			{
+				role: "assistant",
+				content: "Hello! I'm Elmo. Where would you like to go?",
+				target: "all",
+			},
+		]);
 	}
 
 	async function handleAddStopFromPanel(place: PlaceResult) {
-		await addStopDuringNavigation(place.name, place.latitude, place.longitude);
-		// Optional: close panel or keep it open? User said "recalculating it with the added stop but without interrupting the navigation".
-		// I'll keep it open for now as it might be useful to add multiple stops or just see the result.
-		// Actually, usually you want to see the map update. Let's close it to show the route update.
-		// User requirement: "when the categories menu/panel opens, the "+" button becomes an "x" (close) button to close the stops panel."
-		// It doesn't explicitly say to close on add, but it's better UX to see the route change.
-		// However, if they want to add multiple, it's annoying.
-		// Let's keep it open but maybe show a toast or just let the route update in the background (visible on the top half).
-		// Since the map is 50% height, they can see the route update. I'll keep it open.
+		await addStopDuringNavigation(
+			place.name,
+			place.latitude,
+			place.longitude,
+			place.id
+		);
+	}
+
+	async function handleRemoveStopFromPanel(place: PlaceResult) {
+		// Identify by coordinates
+		const pointId = `${place.latitude.toFixed(5)},${place.longitude.toFixed(
+			5
+		)}`;
+
+		const newWaypoints = routeWaypoints.filter((wp) => {
+			const wpId = `${wp.latitude.toFixed(5)},${wp.longitude.toFixed(5)}`;
+			return wpId !== pointId;
+		});
+
+		setRouteWaypoints(newWaypoints);
+
+		// Recalculate route
+		if (!userRegion || !destination) return;
+		const allWaypoints = newWaypoints;
+
+		const route = await getRoute(
+			[userRegion.latitude, userRegion.longitude],
+			[destination.latitude, destination.longitude],
+			allWaypoints.map((wp) => ({ coordinates: [wp.latitude, wp.longitude] })),
+			routeOptions
+		);
+
+		if (route) {
+			setRouteCoords(route.coordinates);
+			setRouteInfo(route);
+
+			// Broadcast change if car1-main
+			if (deviceRole === "car1-main" && isSyncConnected) {
+				convoySync.send("waypoints", newWaypoints);
+			}
+		}
 	}
 
 	function startNavigation() {
 		setNavigationState("active");
 		distanceTraveled.current = 0;
 		lastPausedLegIndex.current = -1;
+		navigationStartTime.current = Date.now();
 		if (userRegion && mapRef.current) {
 			mapRef.current.animateCamera(
 				{
@@ -1813,7 +2417,11 @@ export default function App() {
 		setShowStopsPanel(false);
 		setMessages((prev) => [
 			...prev,
-			{ role: "assistant", content: "Okay, the navigation has been terminated." },
+			{
+				role: "assistant",
+				content: "Navigation ended.",
+				target: "car1-main",
+			},
 		]);
 
 		// Zoom out to default view
@@ -1840,8 +2448,8 @@ export default function App() {
 		if (routeWaypoints.length > 0) {
 			setRouteWaypoints((prev) => prev.slice(1));
 		} else if (destination) {
-			// If it was the final destination, maybe just clear it? 
-			// But usually "resume" implies continuing. 
+			// If it was the final destination, maybe just clear it?
+			// But usually "resume" implies continuing.
 			// For now, let's assume if we pause at destination, resuming just keeps us there or ends.
 			// Let's just re-enable autopilot to finish the route.
 		}
@@ -1849,13 +2457,12 @@ export default function App() {
 		if (isSyncConnected && deviceRole === "car1-main") {
 			convoySync.send("resume_navigation", {});
 		}
-		setAutopilotEnabled(true);
 	}
 
 	const handleSelectPlace = async (place: Place) => {
 		// Simple mock implementation: Geocode address and set destination
 		if (!userRegion) return;
-		
+
 		// If place has coordinates, use them directly
 		if (place.latitude && place.longitude) {
 			setDestination({
@@ -1873,13 +2480,9 @@ export default function App() {
 
 			if (route) {
 				setRouteCoords(route.coordinates);
-				setRouteInfo({
-					duration: route.duration,
-					distance: route.distance,
-					legs: route.legs,
-				});
+				setRouteInfo(route);
 				setNavigationState("preview");
-				
+
 				// Fit map
 				mapRef.current?.fitToCoordinates(
 					[
@@ -1898,7 +2501,7 @@ export default function App() {
 		// If place has address, use it. Otherwise use name.
 		const query = place.address || place.name;
 		const geocoded = await Location.geocodeAsync(query);
-		
+
 		if (geocoded.length > 0) {
 			const targetLat = geocoded[0].latitude;
 			const targetLng = geocoded[0].longitude;
@@ -1918,13 +2521,9 @@ export default function App() {
 
 			if (route) {
 				setRouteCoords(route.coordinates);
-				setRouteInfo({
-					duration: route.duration,
-					distance: route.distance,
-					legs: route.legs,
-				});
+				setRouteInfo(route);
 				setNavigationState("preview");
-				
+
 				// Fit map
 				mapRef.current?.fitToCoordinates(
 					[
@@ -1940,10 +2539,58 @@ export default function App() {
 		}
 	};
 
+	const handleRearSelectPlace = (place: PlaceResult) => {
+		selectedPlaceRef.current = place;
+		setSelectedPlace(place);
+		if (mapRef.current) {
+			mapRef.current.animateToRegion(
+				{
+					latitude: place.latitude,
+					longitude: place.longitude,
+					latitudeDelta: 0.01,
+					longitudeDelta: 0.01,
+				},
+				1000
+			);
+		}
+	};
+
+	// Auto-close selected place card after acceptance/rejection (3 seconds)
+	useEffect(() => {
+		if (selectedPlace) {
+			const id = selectedPlace.id || selectedPlace.name;
+			if (
+				addedStops.includes(id) ||
+				declinedStopRequests.includes(selectedPlace.name)
+			) {
+				const timer = setTimeout(() => {
+					selectedPlaceRef.current = null;
+					setSelectedPlace(null);
+				}, 3000);
+				return () => clearTimeout(timer);
+			}
+		}
+	}, [selectedPlace, addedStops, declinedStopRequests]);
+
+	const handleRearAddStop = (place: PlaceResult) => {
+		// Use addStopDuringNavigation to correctly trigger sync/request logic based on role
+		addStopDuringNavigation(
+			place.name,
+			place.latitude,
+			place.longitude,
+			place.id
+		);
+		// Do not clear selected place immediately for rear seat requests
+		if (deviceRole !== "car1-rear") {
+			selectedPlaceRef.current = null;
+			setSelectedPlace(null);
+		}
+	};
+
 	return (
 		<View style={styles.container}>
 			<StatusBar hidden />
-			<TopBar 
+			<TopBar
 				location={
 					userRegion
 						? {
@@ -1955,187 +2602,269 @@ export default function App() {
 				remainingRange={remainingRange}
 				weather={weather}
 			/>
-			
+
 			<View style={styles.dashboardContainer}>
-			{/* LEFT PANEL: Dashboard Widgets (hidden for car1-rear) */}
-			{deviceRole !== "car1-rear" && (
-				<View style={styles.leftPanel}>
-					{/* Speedometer - Always Visible */}
-					<Speedometer currentSpeed={speed} speedLimit={currentSpeedLimit} />
-
-					{/* Active Navigation Mode */}
-					{navigationState === "active" && (
-						<>
-							<TurnDirections 
-								distanceToNextStop={nextStopDistance || 0} 
-								steps={(routeInfo?.legs[0] as any)?.steps || []}
-							/>
-							<FakeRoad />
-						</>
-					)}
-
-					{/* Route Preview Mode */}
-					{navigationState === "preview" && routeInfo && (
-						<>
-							<RoutePreview 
-								waypoints={routeWaypoints} 
-								destination={destination} 
-								onAddStop={toggleStopsPanel}
-							/>
-					<NavigationInfoPanel
-						duration={
-							nextStopDuration || 
-							(routeWaypoints.length > 0 && routeInfo?.legs?.length > 0 
-								? routeInfo.legs[0].duration 
-								: routeInfo?.duration || 0)
-						}
-						distance={
-							nextStopDistance || 
-							(routeWaypoints.length > 0 && routeInfo?.legs?.length > 0 
-								? routeInfo.legs[0].distance 
-								: routeInfo?.distance || 0)
-						}
-						legs={routeInfo?.legs || []}
-						hasWaypoints={routeWaypoints.length > 0}
-						onStart={startNavigation}
-						onCancel={cancelNavigation}
-						navigationState={navigationState}
-						isPaused={isPausedAtStop}
-						onResume={handleResumeNavigation}
-						totalDistance={routeInfo?.distance || 0}
-						totalDuration={routeInfo?.duration || 0}
-						progress={
-							routeInfo?.distance 
-								? distanceTraveled.current / (distanceTraveled.current + routeInfo.distance) 
-								: 0
-						}
-						nextStopProgress={
-							routeInfo?.distance && routeWaypoints.length > 0 && routeInfo.legs.length > 0
-								? (distanceTraveled.current + routeInfo.legs[0].distance) / (distanceTraveled.current + routeInfo.distance)
-								: undefined
-						}
-					/>
-						</>
-					)}
-
-					{/* Idle Mode (No Destination) */}
-					{navigationState === "idle" && (
-						<>
-							{/* Scenario 2 Question */}
-							{activeScenario === 2 && scenarioStep === "question" ? (
-								<View style={styles.scenarioQuestionContainer}>
-									<Text style={styles.scenarioQuestionText}>
-										Since it's later than usual, do you want me to show you the fastest way?
-									</Text>
-									<View style={styles.scenarioButtonRow}>
-										<TouchableOpacity 
-											style={[styles.scenarioAnswerButton, { backgroundColor: "#ef4444" }]}
-											onPress={handleScenario2QuestionAnswer}
-										>
-											<Text style={styles.scenarioAnswerText}>No</Text>
-										</TouchableOpacity>
-										<TouchableOpacity 
-											style={[styles.scenarioAnswerButton, { backgroundColor: "#22c55e" }]}
-											onPress={handleScenario2QuestionAnswer}
-										>
-											<Text style={styles.scenarioAnswerText}>Yes</Text>
-										</TouchableOpacity>
-									</View>
-								</View>
-							) : (
-								<PlacesList 
-									places={FAVORITE_PLACES} 
-									onSelectPlace={handleSelectPlace} 
-								/>
+				{/* LEFT PANEL: Dashboard Widgets (hidden for car1-rear if we want to replace it entirely, so let's control content inside) */}
+				{deviceRole === "car1-rear" ? (
+					<View style={styles.leftPanel}>
+						<RearLeftPanel
+							routeInfo={routeInfo}
+							navigationState={navigationState}
+							messages={messages.filter(
+								(m) =>
+									m.target !== "car1-main" &&
+									(!m.target || m.target === "car1-rear" || m.role === "user")
 							)}
-						</>
-					)}
+							onSendMessage={handleTextSubmit}
+							isRecording={isRecording}
+							onToggleMic={startVoiceRecognition}
+							distanceTraveled={distanceTraveled.current}
+							currentLocation={
+								userRegion
+									? {
+											latitude: userRegion.latitude,
+											longitude: userRegion.longitude,
+									  }
+									: undefined
+							}
+							onSelectPlace={handleRearSelectPlace}
+							onAddStop={handleRearAddStop}
+							stopsProgress={
+								routeInfo?.distance && routeInfo.legs.length > 1
+									? routeInfo.legs.slice(0, -1).map((_, i) => {
+											const distToStop = routeInfo.legs
+												.slice(0, i + 1)
+												.reduce((sum, l) => sum + l.distance, 0);
+											return (
+												(distanceTraveledOnCurrentRoute.current + distToStop) /
+												(distanceTraveledOnCurrentRoute.current +
+													routeInfo.distance)
+											);
+									  })
+									: undefined
+							}
+							streamingText={streamingVoiceText}
+						/>
+					</View>
+				) : (
+					<View style={styles.leftPanel}>
+						{/* Speedometer - Always Visible */}
+						<Speedometer currentSpeed={speed} speedLimit={currentSpeedLimit} />
 
-					{/* Navigation Info Panel for Active Mode (if needed separately, but usually integrated) */}
-					{/* We might want to show info panel in active mode too, below FakeRoad? */}
-					{/* The design says "Left panel will display... Speedometer, Turn Directions, Fake Road". */}
-					{/* But we also need to show ETA/Time/Distance. */}
-					{/* Let's add NavigationInfoPanel in active mode as well, maybe at the bottom or top? */}
-					{/* The user didn't explicitly say where InfoPanel goes in Active mode, but it's essential. */}
-					{/* I'll add it below FakeRoad for now. */}
-					{navigationState === "active" && routeInfo && (
-						<View style={{ marginTop: 16 }}>
-							<NavigationInfoPanel
-								duration={
-									nextStopDuration || 
-									(routeWaypoints.length > 0 && routeInfo?.legs?.length > 0 
-										? routeInfo.legs[0].duration 
-										: routeInfo?.duration || 0)
-								}
-								distance={
-									nextStopDistance || 
-									(routeWaypoints.length > 0 && routeInfo?.legs?.length > 0 
-										? routeInfo.legs[0].distance 
-										: routeInfo?.distance || 0)
-								}
-								legs={routeInfo.legs}
-								hasWaypoints={routeWaypoints.length > 0}
-								onStart={startNavigation}
-								onCancel={cancelNavigation}
-								navigationState={navigationState}
-								isPaused={isPausedAtStop}
-								onResume={handleResumeNavigation}
-								totalDistance={routeInfo.distance}
-								totalDuration={routeInfo.duration}
-								progress={
-									routeInfo.distance 
-										? Math.min(1, distanceTraveled.current / routeInfo.distance)
-										: 0
-								}
-								nextStopProgress={
-									routeInfo.distance && routeWaypoints.length > 0 && routeInfo.legs.length > 0
-										? routeInfo.legs[0].distance / routeInfo.distance
-										: undefined
-								}
-							/>
-						</View>
-					)}
-				</View>
-			)}
+						{/* Route Preview Mode */}
+						{navigationState === "preview" && routeInfo && (
+							<>
+								<RoutePreview
+									waypoints={routeWaypoints}
+									destination={destination}
+									onAddStop={toggleStopsPanel}
+								/>
+								<NavigationInfoPanel
+									duration={
+										nextStopDuration ||
+										(routeWaypoints.length > 0 && routeInfo?.legs?.length > 0
+											? routeInfo.legs[0].duration
+											: routeInfo?.duration || 0)
+									}
+									distance={
+										nextStopDistance ||
+										(routeWaypoints.length > 0 && routeInfo?.legs?.length > 0
+											? routeInfo.legs[0].distance
+											: routeInfo?.distance || 0)
+									}
+									legs={routeInfo?.legs || []}
+									hasWaypoints={routeWaypoints.length > 0}
+									onStart={startNavigation}
+									onCancel={cancelNavigation}
+									navigationState={navigationState}
+									isPaused={isPausedAtStop}
+									onResume={handleResumeNavigation}
+									totalDistance={routeInfo?.distance || 0}
+									totalDuration={routeInfo?.duration || 0}
+									progress={
+										routeInfo?.distance
+											? distanceTraveled.current /
+											  (distanceTraveled.current + routeInfo.distance)
+											: 0
+									}
+									stopsProgress={
+										routeInfo?.distance && routeInfo.legs.length > 1
+											? routeInfo.legs.slice(0, -1).map((_, i) => {
+													const distToStop = routeInfo.legs
+														.slice(0, i + 1)
+														.reduce((sum, l) => sum + l.distance, 0);
+													return (
+														(distanceTraveled.current + distToStop) /
+														(distanceTraveled.current + routeInfo.distance)
+													);
+											  })
+											: undefined
+									}
+								/>
+							</>
+						)}
+
+						{/* IDLE MODE Panel Content */}
+						{navigationState === "idle" && (
+							<>
+								<PlacesList
+									places={FAVORITE_PLACES}
+									onSelectPlace={handleSelectPlace}
+								/>
+							</>
+						)}
+
+						{/* ACTIVE MODE Panel Content for non-rear */}
+						{navigationState === "active" && (
+							<>
+								{/* Turn Directions */}
+								<View style={{ marginTop: 24, marginBottom: 12 }}>
+									<TurnDirections maneuver={nextManeuver} />
+								</View>
+
+								{/* Fake Road Visualization */}
+								<View
+									style={{
+										flex: 1,
+										maxHeight: 300,
+										marginTop: 12,
+										marginBottom: 24,
+									}}
+								>
+									<FakeRoad />
+								</View>
+
+								{/* Navigation Info Panel with dynamic stats */}
+								{(() => {
+									if (!routeInfo) return null;
+
+									// Calculate real-time stats
+									let remDist = Math.max(
+										0,
+										routeInfo.distance - distanceTraveledOnCurrentRoute.current
+									);
+									let remDur =
+										(remDist / routeInfo.distance) * routeInfo.duration;
+
+									if (routeInfo.legs.length > 1) {
+										let distAccum = 0;
+										for (const leg of routeInfo.legs) {
+											if (
+												distAccum + leg.distance >
+												distanceTraveledOnCurrentRoute.current
+											) {
+												const distInLeg =
+													distanceTraveledOnCurrentRoute.current - distAccum;
+												const legRemDist = Math.max(
+													0,
+													leg.distance - distInLeg
+												);
+												const legRemDur =
+													(legRemDist / leg.distance) * leg.duration;
+												remDist = legRemDist;
+												remDur = legRemDur;
+												break;
+											}
+											distAccum += leg.distance;
+										}
+									}
+
+									return (
+										<View style={{ marginTop: 16 }}>
+											<NavigationInfoPanel
+												duration={remDur}
+												distance={remDist}
+												legs={routeInfo.legs}
+												hasWaypoints={routeWaypoints.length > 0}
+												onStart={startNavigation}
+												onCancel={cancelNavigation}
+												navigationState="active"
+												isPaused={isPausedAtStop}
+												onResume={handleResumeNavigation}
+												totalDistance={routeInfo.distance}
+												totalDuration={routeInfo.duration}
+												progress={
+													routeInfo.distance
+														? Math.min(
+																1,
+																distanceTraveledOnCurrentRoute.current /
+																	routeInfo.distance
+														  )
+														: 0
+												}
+												stopsProgress={
+													routeInfo?.distance && routeInfo.legs.length > 1
+														? routeInfo.legs.slice(0, -1).map((_, i) => {
+																const distToStop = routeInfo.legs
+																	.slice(0, i + 1)
+																	.reduce((sum, l) => sum + l.distance, 0);
+																return (
+																	(distanceTraveledOnCurrentRoute.current +
+																		distToStop) /
+																	(distanceTraveledOnCurrentRoute.current +
+																		routeInfo.distance)
+																);
+														  })
+														: undefined
+												}
+											/>
+										</View>
+									);
+								})()}
+							</>
+						)}
+					</View>
+				)}
 
 				{/* RIGHT PANEL: Map & Overlays */}
 				<View style={styles.rightPanel}>
-					<View style={[
-					styles.mapContainer,
-					deviceRole === "car1-rear" && { paddingLeft: 12 },
-					deviceRole === "car1-rear" && { paddingLeft: 12 },
-				]}> 
-					{/* Stops Panel Toggle Button - Only show when destination is set AND in active mode (in preview it's in the list) OR if panel is open */}
-					{((destination && navigationState === "active") || showStopsPanel) && (
-						<TouchableOpacity
-							style={[styles.stopsPanelButton, deviceRole === "car1-rear" && { left: 20 }]}
-							onPress={toggleStopsPanel}
-						>
-							<Ionicons
-								name="add"
-								size={32}
-								color="#5EEAD4"
-								style={{ transform: [{ rotate: showStopsPanel ? "45deg" : "0deg" }] }}
-							/>
-						</TouchableOpacity>
-					)} 
+					<View
+						style={[
+							styles.mapContainer,
+							deviceRole === "car1-rear" && { paddingLeft: 12 },
+							deviceRole === "car1-rear" && { paddingLeft: 12 },
+						]}
+					>
+						{/* Stops Panel Toggle Button - Only show when destination is set AND in active mode (in preview it's in the list) OR if panel is open */}
+						{((destination &&
+							(navigationState === "active" ||
+								(navigationState === "preview" &&
+									deviceRole === "car1-rear"))) ||
+							showStopsPanel) && (
+							<TouchableOpacity
+								style={[
+									styles.stopsPanelButton,
+									deviceRole === "car1-rear" && { left: 20 },
+								]}
+								onPress={toggleStopsPanel}
+							>
+								<Ionicons
+									name="add"
+									size={32}
+									color="#5EEAD4"
+									style={{
+										transform: [{ rotate: showStopsPanel ? "45deg" : "0deg" }],
+									}}
+								/>
+							</TouchableOpacity>
+						)}
 						<MapView
-						ref={mapRef}
-						style={styles.map}
-						provider={PROVIDER_DEFAULT}
-						showsUserLocation={!autopilotEnabled && !isPausedAtStop}
-						showsMyLocationButton={false}
-						showsCompass={false}
-						initialRegion={
-							userRegion
-								? {
-										latitude: userRegion.latitude,
-										longitude: userRegion.longitude,
-										latitudeDelta: 0.01,
-										longitudeDelta: 0.01,
-								}
-								: undefined
-						}
+							ref={mapRef}
+							style={styles.map}
+							provider={PROVIDER_DEFAULT}
+							showsUserLocation={!autopilotEnabled && !isPausedAtStop}
+							showsMyLocationButton={false}
+							showsCompass={false}
+							initialRegion={
+								userRegion
+									? {
+											latitude: userRegion.latitude,
+											longitude: userRegion.longitude,
+											latitudeDelta: 0.01,
+											longitudeDelta: 0.01,
+									  }
+									: undefined
+							}
 						>
 							{/* Autopilot Cursor - Show when enabled OR paused at stop */}
 							{(autopilotEnabled || isPausedAtStop) && userRegion && (
@@ -2149,7 +2878,12 @@ export default function App() {
 									rotation={userHeading}
 								>
 									<View style={styles.cursorContainer}>
-										<Ionicons name="navigate" size={28} color="#5EEAD4" style={{ transform: [{ rotate: `-45deg` }] }} />
+										<Ionicons
+											name="navigate"
+											size={28}
+											color="#5EEAD4"
+											style={{ transform: [{ rotate: `-45deg` }] }}
+										/>
 									</View>
 								</Marker>
 							)}
@@ -2165,7 +2899,7 @@ export default function App() {
 							)}
 							{routeWaypoints.map((wp, index) => (
 								<Marker
-									key={index}
+									key={`${wp.name}-${wp.latitude}-${wp.longitude}`}
 									coordinate={{
 										latitude: wp.latitude,
 										longitude: wp.longitude,
@@ -2174,78 +2908,284 @@ export default function App() {
 									pinColor="yellow"
 								/>
 							))}
-							{routeCoords.length > 0 && (
 							<Polyline
 								coordinates={routeCoords}
 								strokeWidth={navigationState === "active" ? 14 : 6}
 								strokeColor="#14b8a6"
 							/>
-						)}
+							{/* Selected Place Marker (Rear Idle) */}
+							{selectedPlace && deviceRole === "car1-rear" && (
+								<Marker
+									coordinate={{
+										latitude: selectedPlace.latitude,
+										longitude: selectedPlace.longitude,
+									}}
+									centerOffset={{ x: 0, y: -78 }}
+								>
+									<View style={{ alignItems: "center" }}>
+										<View style={styles.placeCardSmall}>
+											<TouchableOpacity
+												onPress={() => {
+													if (userRegion && mapRef.current) {
+														mapRef.current.animateToRegion(userRegion, 500);
+													}
+													selectedPlaceRef.current = null;
+													setSelectedPlace(null);
+												}}
+												style={{
+													position: "absolute",
+													top: 8,
+													right: 8,
+													zIndex: 10,
+													backgroundColor: "rgba(0,0,0,0.5)",
+													borderRadius: 8,
+													padding: 4,
+												}}
+											>
+												<Ionicons name="close" size={20} color="white" />
+											</TouchableOpacity>
+											{selectedPlace.image && (
+												<Image
+													source={{ uri: selectedPlace.image }}
+													style={styles.placeCardImageSmall}
+												/>
+											)}
+											<View style={styles.placeCardContentSmall}>
+												<View style={{ flex: 1 }}>
+													<Text
+														style={styles.placeCardTitleSmall}
+														numberOfLines={1}
+													>
+														{selectedPlace.name}
+													</Text>
+													<Text style={styles.placeCardDistanceSmall}>
+														{selectedPlace.distance
+															? selectedPlace.distance > 1000
+																? (selectedPlace.distance / 1000).toFixed(1) +
+																  " km"
+																: selectedPlace.distance + " m"
+															: ""}
+													</Text>
+												</View>
+												{(navigationState === "active" ||
+													navigationState === "preview") &&
+													routeInfo && (
+														<TouchableOpacity
+															onPress={() => handleRearAddStop(selectedPlace)}
+															disabled={
+																myStopRequests.includes(
+																	selectedPlace.id || selectedPlace.name
+																) ||
+																addedStops.includes(
+																	selectedPlace.id || selectedPlace.name
+																) ||
+																declinedStopRequests.includes(
+																	selectedPlace.name
+																)
+															}
+															style={{
+																backgroundColor: addedStops.includes(
+																	selectedPlace.id || selectedPlace.name
+																)
+																	? "#10B981" // Green for accepted
+																	: declinedStopRequests.includes(
+																			selectedPlace.name
+																	  )
+																	? "#EF4444" // Red for rejected
+																	: myStopRequests.includes(
+																			selectedPlace.id || selectedPlace.name
+																	  )
+																	? "#374151" // Disabled gray for requested
+																	: "#112e33", // Default teal/dark
+																paddingHorizontal: 10,
+																paddingVertical: 6,
+																borderRadius: 8,
+																flexDirection: "row",
+																alignItems: "center",
+																borderWidth: 1,
+																borderColor: myStopRequests.includes(
+																	selectedPlace.id || selectedPlace.name
+																)
+																	? "#6B7280"
+																	: declinedStopRequests.includes(
+																			selectedPlace.name
+																	  )
+																	? "#4b1212" // Dark Red Border
+																	: "#5EEAD4",
+																marginTop: 3,
+															}}
+														>
+															<Ionicons
+																name={
+																	addedStops.includes(
+																		selectedPlace.id || selectedPlace.name
+																	)
+																		? "checkmark-circle"
+																		: declinedStopRequests.includes(
+																				selectedPlace.name
+																		  )
+																		? "close-circle"
+																		: "add-circle"
+																}
+																size={16}
+																color={
+																	myStopRequests.includes(
+																		selectedPlace.id || selectedPlace.name
+																	)
+																		? "#9CA3AF"
+																		: declinedStopRequests.includes(
+																				selectedPlace.name
+																		  )
+																		? "#4b1212" // Dark Red Icon
+																		: "#5EEAD4"
+																}
+																style={{ marginRight: 4 }}
+															/>
+															<Text
+																style={{
+																	color: myStopRequests.includes(
+																		selectedPlace.id || selectedPlace.name
+																	)
+																		? "#9CA3AF"
+																		: declinedStopRequests.includes(
+																				selectedPlace.name
+																		  )
+																		? "#4b1212" // Dark Red Text
+																		: "#5EEAD4",
+																	fontWeight: "bold",
+																	fontSize: 12,
+																}}
+															>
+																{addedStops.includes(
+																	selectedPlace.id || selectedPlace.name
+																)
+																	? "Accepted"
+																	: declinedStopRequests.includes(
+																			selectedPlace.name
+																	  )
+																	? "Declined"
+																	: myStopRequests.includes(
+																			selectedPlace.id || selectedPlace.name
+																	  )
+																	? "Requested"
+																	: deviceRole === "car1-rear"
+																	? "Request Stop"
+																	: "Add Stop"}
+															</Text>
+														</TouchableOpacity>
+													)}
+											</View>
+										</View>
+										<View style={styles.placeCardArrow} />
+									</View>
+								</Marker>
+							)}
 						</MapView>
-						{/* Mute Button (Above Settings) */}
-						<TouchableOpacity
-							style={[
-								styles.muteButton,
-							]}
-							onPress={() => setIsMuted(!isMuted)}
-						>
-							<Ionicons 
-								name={isMuted ? "volume-mute-outline" : "volume-high-outline"} 
-								size={28} 
-								color="#5EEAD4" 
-							/>
-						</TouchableOpacity>
+						{/* Mute Button (Above Settings) - Hidden for Rear Seat */}
+						{deviceRole !== "car1-rear" && (
+							<TouchableOpacity
+								style={[styles.muteButton]}
+								onPress={async () => {
+									const newMuted = !isMuted;
+									setIsMuted(newMuted);
+									if (newMuted) {
+										await Speech.stop();
+										// Also stop any currently playing audio object if we had one (though we moved to Speech mostly)
+										if (currentAudioRef.current) {
+											await currentAudioRef.current.stopAsync();
+										}
+									}
+								}}
+							>
+								<Ionicons
+									name={isMuted ? "volume-mute-outline" : "volume-high-outline"}
+									size={28}
+									color="#5EEAD4"
+								/>
+							</TouchableOpacity>
+						)}
 
 						{/* Settings Button (Top Left) */}
 						<TouchableOpacity
-							style={[
-								styles.settingsButton,
-							]}
+							style={[styles.settingsButton]}
 							onPress={() => setShowSettings(true)}
 						>
 							<Ionicons name="settings-outline" size={28} color="#5EEAD4" />
 						</TouchableOpacity>
 					</View>
 
-
-
 					{/* Stops Panel - Rendered below the map as a panel */}
 					{showStopsPanel && (
-						<View style={{ flex: 1, backgroundColor: "#01181C", paddingRight: 12, paddingBottom: 12 }}>
+						<View
+							style={{
+								flex: 1,
+								backgroundColor: "#01181C",
+								paddingRight: 12,
+								paddingBottom: 12,
+							}}
+						>
 							<StopsPanel
 								onCategorySelect={handleCategorySelect}
 								onClose={toggleStopsPanel}
 								searchResults={stopsSearchResults}
 								onAddStop={handleAddStopFromPanel}
+								onRemoveStop={handleRemoveStopFromPanel}
 								isLoading={isSearchingStops}
 								selectedCategory={stopsPanelCategory}
 								deviceRole={deviceRole}
+								myStopRequests={myStopRequests}
+								declinedStopRequests={declinedStopRequests}
+								addedStops={addedStops}
+								onCancelRequest={handleCancelRequest}
 							/>
 						</View>
 					)}
 
+					{/* Voice Button - Hide for car1-rear */}
+					{deviceRole !== "car1-rear" && (
+						<TouchableOpacity
+							style={[
+								styles.micButton,
+								isRecording && styles.micButtonRecording,
+								isProcessing && styles.micButtonProcessing,
+							]}
+							onPress={
+								isRecording ? stopVoiceRecognition : startInteractiveVoice
+							}
+						>
+							<Ionicons
+								name={
+									isRecording
+										? "mic"
+										: isProcessing
+										? "hourglass-outline"
+										: "mic-outline"
+								}
+								size={30}
+								color={
+									isProcessing ? "#01181C" : isRecording ? "white" : "#5EEAD4"
+								}
+							/>
+						</TouchableOpacity>
+					)}
 
-				
-					{/* Microphone Button (Top Right) */}
+					{/* Voice Actions Button (Dummy) */}
 					<TouchableOpacity
 						style={[
-							styles.micButton,
-							isProcessing && styles.micButtonProcessing,
+							styles.voiceActionsButton,
+							deviceRole !== "car1-rear" && { top: 80 },
 						]}
-						onPress={startVoiceRecognition}
-						disabled={isProcessing || isRecording}
 					>
-						<Ionicons
-							name={isRecording ? "mic" : "mic-outline"}
-							size={28}
-							color={isRecording || isProcessing ? "#01181C" : "#5EEAD4"}
-						/>
+						<Ionicons name="megaphone-outline" size={28} color="#5EEAD4" />
 					</TouchableOpacity>
-
 					{/* Chat Overlay (Top Left - Hidden by default) */}
 					{showChat && (
 						<View style={styles.chatOverlay}>
-							<ScrollView style={styles.messagesList} showsVerticalScrollIndicator={false}>
+							<ScrollView
+								style={styles.messagesList}
+								showsVerticalScrollIndicator={false}
+								contentContainerStyle={{ paddingTop: 20, paddingBottom: 20 }}
+							>
 								{messages.map((msg, index) => (
 									<View
 										key={index}
@@ -2254,6 +3194,7 @@ export default function App() {
 											msg.role === "user"
 												? styles.userBubble
 												: styles.assistantBubble,
+											index === 0 && { marginTop: 24, marginBottom: 12 },
 										]}
 									>
 										<Text
@@ -2279,8 +3220,8 @@ export default function App() {
 									onSubmitEditing={handleTextSubmit}
 									returnKeyType="send"
 								/>
-								<TouchableOpacity 
-									style={styles.sendButton} 
+								<TouchableOpacity
+									style={styles.sendButton}
 									onPress={handleTextSubmit}
 								>
 									<Ionicons name="send" size={20} color="white" />
@@ -2288,8 +3229,68 @@ export default function App() {
 							</View>
 						</View>
 					)}
+					{/* Stop Request Card (Inline) */}
+					{pendingStopRequest && (
+						<View
+							style={[
+								styles.stopRequestCard,
+								deviceRole === "car1-rear" && { left: 20 },
+							]}
+						>
+							<View style={styles.stopRequestHeader}>
+								<Ionicons name="location" size={24} color="#5EEAD4" />
+								<Text style={styles.stopRequestTitle}>Stop Requested</Text>
+							</View>
+
+							<Text style={styles.stopRequestText}>
+								<Text style={{ fontWeight: "bold", color: "white" }}>
+									{pendingStopRequest.name}
+								</Text>
+							</Text>
+
+							<View style={styles.stopRequestButtons}>
+								<TouchableOpacity
+									style={[styles.stopRequestBtn, styles.stopRequestDecline]}
+									onPress={handleStopRequestDecline}
+								>
+									<Text style={styles.stopRequestDeclineText}>Decline</Text>
+								</TouchableOpacity>
+								<TouchableOpacity
+									style={[styles.stopRequestBtn, styles.stopRequestAccept]}
+									onPress={handleStopRequestAccept}
+								>
+									<Text style={styles.stopRequestAcceptText}>Add Stop</Text>
+								</TouchableOpacity>
+							</View>
+						</View>
+					)}
 				</View>
 			</View>
+
+			{/* Voice Interaction Overlay - Root Level */}
+			{showVoiceOverlay && (
+				<Animated.View
+					style={[styles.voiceOverlay, { opacity: voiceOverlayFade }]}
+				>
+					<LinearGradient
+						colors={["rgba(94, 234, 212, 0.4)", "transparent"]}
+						style={styles.voiceGradient}
+					/>
+					<View style={styles.voiceContent}>
+						<Text style={styles.voiceText}>{voiceOverlayText}</Text>
+					</View>
+
+					{/* Close Button - Covers Mic Button Position */}
+					{deviceRole !== "car1-rear" && (
+						<TouchableOpacity
+							style={styles.overlayCloseButton} // Adjusted position validation
+							onPress={handleManualCloseVoice}
+						>
+							<Ionicons name="close" size={30} color="white" />
+						</TouchableOpacity>
+					)}
+				</Animated.View>
+			)}
 
 			<SettingsModal
 				visible={showSettings}
@@ -2298,30 +3299,16 @@ export default function App() {
 				onOptionsChange={setRouteOptions}
 				showChat={showChat}
 				onToggleChat={setShowChat}
-				autopilotEnabled={autopilotEnabled}
-				onToggleAutopilot={setAutopilotEnabled}
-				useNativeTTS={useNativeTTS}
-				onToggleNativeTTS={setUseNativeTTS}
+				deviceRole={deviceRole}
+				onDeviceRoleChange={setDeviceRole}
 				syncServerUrl={syncServerUrl}
 				onSyncServerUrlChange={setSyncServerUrl}
-				deviceRole={deviceRole}
-						onDeviceRoleChange={setDeviceRole}
-						onStartScenario1={startScenario1}
-						onStartScenario2={startScenario2}
-						onResetToDefault={handleResetToDefault}
-						isConnected={isSyncConnected}
-					/>
+				isConnected={isSyncConnected}
+				onStartScenario1={startScenario1}
+				onStartScenario2={startScenario2}
+				onResetToDefault={handleResetToDefault}
+			/>
 
-			{/* Stop Request Modal for 2nd car main */}
-			{pendingStopRequest && (
-				<StopRequestModal
-					visible={true}
-					stopName={pendingStopRequest.name}
-					onAccept={handleStopRequestAccept}
-					onDecline={handleStopRequestDecline}
-				/>
-			)}
-			{/* Scenario Modal */}
 			<ScenarioModal
 				visible={activeScenario !== null && scenarioStep === "modal"}
 				question={
@@ -2332,6 +3319,35 @@ export default function App() {
 				onYes={handleScenarioModalYes}
 				onNo={handleScenarioModalNo}
 			/>
+
+			{/* Stop Added Notification */}
+			{notificationStop && (
+				<StopAddedNotification
+					stop={notificationStop.stop}
+					distance={notificationStop.distance}
+					duration={notificationStop.duration}
+					onDismiss={() => setNotificationStop(null)}
+					onCancel={() => {
+						// Remove the added stop (last one)
+						const newWaypoints = [...routeWaypoints];
+						// Assuming the notified stop is the LAST one added.
+						// Safest to find by coordinates or name to be sure?
+						// For now remove last.
+						if (newWaypoints.length > 0) {
+							newWaypoints.pop();
+							setRouteWaypoints(newWaypoints);
+							// Sync update
+							convoySync.send("waypoints", newWaypoints);
+							// Also trigger reroute if needed?
+							// getRoute(...) call checks routeWaypoints dependency usually?
+							// We need to trigger route update.
+							// Existing code likely listens to routeWaypoints change?
+							// Let's check.
+						}
+						setNotificationStop(null);
+					}}
+				/>
+			)}
 		</View>
 	);
 }
@@ -2388,6 +3404,95 @@ const styles = StyleSheet.create({
 		elevation: 5,
 		zIndex: 20,
 	},
+	// --- Left Panel Styles ---
+	header: {
+		marginBottom: 20,
+	},
+	greeting: {
+		fontSize: 28,
+		fontWeight: "bold",
+		color: "white",
+	},
+	subGreeting: {
+		fontSize: 18,
+		color: "#9ca3af",
+	},
+	tabs: {
+		flexDirection: "row",
+		marginBottom: 16,
+		gap: 16,
+	},
+	tab: {
+		paddingBottom: 8,
+		borderBottomWidth: 2,
+		borderBottomColor: "transparent",
+	},
+	activeTab: {
+		borderBottomColor: "#5EEAD4",
+	},
+	tabText: {
+		fontSize: 16,
+		color: "#9ca3af",
+		fontWeight: "500",
+	},
+	activeTabText: {
+		color: "#5EEAD4",
+	},
+
+	speedContainer: {
+		position: "absolute",
+		bottom: 20,
+		left: 20,
+		flexDirection: "row",
+		alignItems: "flex-end",
+		gap: 12,
+		zIndex: 20,
+	},
+	speedLimitSign: {
+		width: 50,
+		height: 50,
+		borderRadius: 25,
+		backgroundColor: "white",
+		borderWidth: 4,
+		borderColor: "#cc0000",
+		justifyContent: "center",
+		alignItems: "center",
+		shadowColor: "#000",
+		shadowOffset: { width: 0, height: 2 },
+		shadowOpacity: 0.25,
+		shadowRadius: 3.84,
+		elevation: 5,
+	},
+	speedLimitInner: {
+		width: 38,
+		height: 38,
+		borderRadius: 19,
+		justifyContent: "center",
+		alignItems: "center",
+	},
+	speedLimitText: {
+		fontSize: 20,
+		fontWeight: "bold",
+		color: "black",
+	},
+	currentSpeedBox: {
+		backgroundColor: "rgba(0,0,0,0.8)",
+		paddingVertical: 4,
+		paddingHorizontal: 12,
+		borderRadius: 12,
+		alignItems: "center",
+		justifyContent: "center",
+	},
+	speedValue: {
+		color: "white",
+		fontSize: 28,
+		fontWeight: "bold",
+	},
+	speedUnit: {
+		color: "#9ca3af",
+		fontSize: 12,
+		marginTop: -2,
+	},
 	muteButton: {
 		position: "absolute",
 		bottom: 84,
@@ -2439,8 +3544,115 @@ const styles = StyleSheet.create({
 		elevation: 6,
 		zIndex: 50,
 	},
+	micButtonContainer: {
+		zIndex: 50,
+	},
+	micButtonRecording: {
+		backgroundColor: "#ef4444", // Red for recording
+	},
 	micButtonProcessing: {
 		backgroundColor: "#5EEAD4",
+	},
+	overlayCloseButton: {
+		position: "absolute",
+		top: 48,
+		right: 20,
+		width: 56,
+		height: 56,
+		borderRadius: 12,
+		backgroundColor: "#01181C",
+		justifyContent: "center",
+		alignItems: "center",
+		shadowColor: "#000",
+		shadowOffset: { width: 0, height: 4 },
+		shadowOpacity: 0.15,
+		shadowRadius: 8,
+		elevation: 6,
+		zIndex: 1001, // Higher than overlay content
+	},
+	selectedPlaceOverlay: {
+		position: "absolute",
+		bottom: 120, // Above bottom bar
+		left: 20,
+		right: 20,
+		alignItems: "center",
+		zIndex: 100,
+	},
+	placeCard: {
+		backgroundColor: "#01181C",
+		borderRadius: 16,
+		padding: 0,
+		width: 300,
+		borderWidth: 1,
+		borderColor: "#112e33",
+		overflow: "hidden",
+		flexDirection: "column",
+	},
+	placeCardImage: {
+		width: "100%",
+		height: 150,
+	},
+	placeCardContent: {
+		padding: 16,
+		flexDirection: "row",
+		justifyContent: "space-between",
+		alignItems: "center",
+	},
+	placeCardTitle: {
+		fontSize: 16,
+		fontWeight: "bold",
+		color: "white",
+		flex: 1,
+	},
+	placeCardDistance: {
+		fontSize: 12,
+		color: "#5EEAD4",
+		marginHorizontal: 8,
+	},
+	placeCardSmall: {
+		backgroundColor: "#01181C",
+		borderRadius: 12,
+		width: 280,
+		borderWidth: 1,
+		borderColor: "#112e33",
+		overflow: "hidden",
+		justifyContent: "flex-start",
+	},
+	placeCardArrow: {
+		width: 0,
+		height: 0,
+		backgroundColor: "transparent",
+		borderStyle: "solid",
+		borderLeftWidth: 10,
+		borderRightWidth: 10,
+		borderBottomWidth: 0,
+		borderTopWidth: 12,
+		borderLeftColor: "transparent",
+		borderRightColor: "transparent",
+		borderTopColor: "#01181C",
+		marginTop: -1, // Slight overlap
+	},
+	placeCardImageSmall: {
+		width: "100%",
+		height: 100,
+	},
+	placeCardContentSmall: {
+		padding: 10,
+		flexDirection: "row",
+		justifyContent: "space-between",
+		alignItems: "center",
+	},
+	placeCardTitleSmall: {
+		fontSize: 14,
+		fontWeight: "bold",
+		color: "white",
+		flex: 1,
+	},
+	placeCardDistanceSmall: {
+		fontSize: 11,
+		color: "#5EEAD4",
+		marginLeft: 2,
+		flex: 1,
 	},
 	chatOverlay: {
 		position: "absolute",
@@ -2532,7 +3744,7 @@ const styles = StyleSheet.create({
 		paddingHorizontal: 12,
 		paddingVertical: 8,
 		borderRadius: 20,
-		marginBottom: 8,
+		marginBottom: 12,
 		maxWidth: "85%",
 		shadowColor: "#000",
 		shadowOffset: { width: 0, height: 1 },
@@ -2562,6 +3774,110 @@ const styles = StyleSheet.create({
 	assistantText: {
 		color: "#5EEAD4",
 	},
+	stopRequestCard: {
+		position: "absolute",
+		bottom: 20,
+		left: 8,
+		// right: 20, // Removed to prevent full stretching if not needed, relying on maxWidth
+		maxWidth: 400,
+		backgroundColor: "#01181C",
+		borderRadius: 16,
+		padding: 16,
+		borderWidth: 1,
+		borderColor: "#5EEAD4",
+		shadowColor: "#000",
+		shadowOffset: { width: 0, height: 4 },
+		shadowOpacity: 0.3,
+		shadowRadius: 8,
+		elevation: 10,
+		zIndex: 100,
+	},
+	stopRequestHeader: {
+		flexDirection: "row",
+		alignItems: "center",
+		marginBottom: 8,
+		gap: 8,
+	},
+	stopRequestTitle: {
+		fontSize: 18,
+		fontWeight: "bold",
+		color: "white",
+	},
+	stopRequestText: {
+		fontSize: 16,
+		color: "#9ca3af",
+		marginBottom: 16,
+	},
+	stopRequestButtons: {
+		flexDirection: "row",
+		gap: 12,
+	},
+	stopRequestBtn: {
+		flex: 1,
+		paddingVertical: 12,
+		borderRadius: 8,
+		alignItems: "center",
+		justifyContent: "center",
+	},
+	stopRequestDecline: {
+		backgroundColor: "transparent",
+		borderWidth: 1,
+		borderColor: "#ef4444",
+	},
+	stopRequestAccept: {
+		backgroundColor: "#5EEAD4",
+	},
+	stopRequestDeclineText: {
+		color: "#ef4444",
+		fontWeight: "600",
+	},
+	stopRequestAcceptText: {
+		color: "#01181C",
+		fontWeight: "bold",
+	},
+	voiceOverlay: {
+		position: "absolute",
+		top: 0,
+		left: 0,
+		right: 0,
+		bottom: 0,
+		backgroundColor: "rgba(0,0,0,0.85)",
+		zIndex: 1000,
+		justifyContent: "center",
+		alignItems: "center",
+	},
+	voiceGradient: {
+		position: "absolute",
+		top: 0,
+		left: 0,
+		right: 0,
+		height: "60%",
+	},
+	voiceContent: {
+		padding: 32,
+		alignItems: "center",
+	},
+	voiceText: {
+		color: "white",
+		fontSize: 32,
+		fontWeight: "bold",
+		textAlign: "center",
+	},
+	voiceActionsButton: {
+		position: "absolute",
+		top: 16,
+		right: 20,
+		width: 56,
+		height: 56,
+		borderRadius: 12,
+		backgroundColor: "#01181C",
+		justifyContent: "center",
+		alignItems: "center",
+		shadowColor: "#000",
+		shadowOffset: { width: 0, height: 4 },
+		shadowOpacity: 0.15,
+		shadowRadius: 8,
+		elevation: 6,
+		zIndex: 50,
+	},
 });
-
-

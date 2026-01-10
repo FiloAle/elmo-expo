@@ -49,7 +49,7 @@ export interface ConvoyRange {
 }
 
 export interface ConvoyData {
-	type: 
+	type:
 		| "location"
 		| "destination"
 		| "route"
@@ -58,6 +58,8 @@ export interface ConvoyData {
 		| "waypoints"
 		| "navigation_state"
 		| "stop_request"
+		| "stop_request_declined"
+		| "stop_request_cancelled"
 		| "request_add_waypoint"
 		| "waypoint_added"
 		| "chat_history"
@@ -93,8 +95,10 @@ class ConvoySync {
 		this.deviceRole = deviceRole;
 		this.reconnectAttempts = 0;
 
-		console.log(`[ConvoySync] Initializing as ${deviceRole} with server ${serverUrl}`);
-		
+		console.log(
+			`[ConvoySync] Initializing as ${deviceRole} with server ${serverUrl}`
+		);
+
 		// Try WebSocket first
 		this.connectWebSocket();
 	}
@@ -106,7 +110,7 @@ class ConvoySync {
 		this.isConnecting = true;
 		const wsUrl = this.serverUrl.startsWith("http")
 			? this.serverUrl.replace("http", "ws")
-			: `ws://${this.serverUrl}`;
+			: `ws://${this.serverUrl}:3001`;
 
 		try {
 			console.log(`[ConvoySync] Connecting to WebSocket: ${wsUrl}`);
@@ -148,7 +152,9 @@ class ConvoySync {
 				if (this.reconnectAttempts < this.maxReconnectAttempts) {
 					this.scheduleReconnect();
 				} else {
-					console.log("[ConvoySync] Max reconnect attempts reached, falling back to polling");
+					console.log(
+						"[ConvoySync] Max reconnect attempts reached, falling back to polling"
+					);
 					this.startPolling();
 				}
 			};
@@ -166,7 +172,9 @@ class ConvoySync {
 		this.reconnectAttempts++;
 		const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
 
-		console.log(`[ConvoySync] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+		console.log(
+			`[ConvoySync] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`
+		);
 
 		this.reconnectTimeout = setTimeout(() => {
 			this.reconnectTimeout = null;
@@ -184,7 +192,7 @@ class ConvoySync {
 			try {
 				const httpUrl = this.serverUrl!.startsWith("http")
 					? this.serverUrl
-					: `http://${this.serverUrl}`;
+					: `http://${this.serverUrl}:3001`;
 
 				const response = await fetch(`${httpUrl}/convoy/poll`, {
 					method: "POST",
@@ -234,7 +242,7 @@ class ConvoySync {
 		try {
 			const httpUrl = this.serverUrl.startsWith("http")
 				? this.serverUrl
-				: `http://${this.serverUrl}`;
+				: `http://${this.serverUrl}:3001`;
 
 			await fetch(`${httpUrl}/convoy/send`, {
 				method: "POST",

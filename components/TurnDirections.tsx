@@ -1,67 +1,111 @@
+import { Maneuver } from "@/lib/navigation";
 import { Ionicons } from "@expo/vector-icons";
 import React from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 interface TurnDirectionsProps {
-	distanceToNextStop: number;
-	steps: any[]; // RouteStep[] from routing.ts
+	maneuver: Maneuver | null;
 }
 
-export function TurnDirections({ distanceToNextStop, steps }: TurnDirectionsProps) {
-	// Find the current step based on distance?
-	// Since we don't track step index, we can try to find the first step that matches the remaining distance?
-	// Or just show the first step that has a maneuver?
-	// Actually, OSRM steps are sequential.
-	// If we just show the first step, it's the start.
-	// We need to filter out passed steps.
-	// But we don't know which ones are passed without tracking.
-	// For now, let's just show the *next* major maneuver if available.
-	// If we assume the simulation follows the route, we can't easily map back without index.
-	// BUT, the user wants "next turn's information".
-	// If we are just simulating, maybe we can just show the first step that is "turn" or "arrive"?
-	// Let's try to show the first step that is NOT "depart" (type).
-	
-	// Better approach:
-	// We can't easily track steps without updating state in the loop.
-	// But we can show a generic "Follow route" if we don't know.
-	// However, the user explicitly asked for "next turn's information".
-	// I'll try to show the first step from the list.
-	// Note: In a real app, we would slice the steps array as we pass coordinates.
-	// Since I can't easily change the simulation loop to slice steps right now (it uses coords),
-	// I'll just show the first step's instruction as a placeholder for "Next Turn".
-	// It's better than "Follow route".
-	
-	const nextStep = steps && steps.length > 0 ? steps.find(s => s.maneuver.type !== "depart") : null;
-	
+export function TurnDirections({ maneuver }: TurnDirectionsProps) {
+	if (!maneuver) {
+		return null;
+	}
+
 	const getInstruction = () => {
-		if (distanceToNextStop < 50) return { icon: "stop-circle-outline", text: "Arriving at destination" };
-		
-		if (nextStep) {
-			// Map OSRM maneuver to icon and text
-			const { type, modifier } = nextStep.maneuver;
-			let icon = "navigate";
-			let text = nextStep.name || "Next turn";
-			
-			if (type === "turn") {
-				if (modifier?.includes("right")) icon = "arrow-forward";
-				else if (modifier?.includes("left")) icon = "arrow-back";
-			} else if (type === "new name") {
-				icon = "arrow-up";
-			} else if (type === "roundabout") {
-				icon = "refresh";
-			}
-			
-			// Construct text
-			if (modifier && type === "turn") {
-				text = `Turn ${modifier} onto ${nextStep.name || "road"}`;
-			} else {
-				text = nextStep.name || type;
-			}
-			
-			return { icon, text: `${text} in ${(distanceToNextStop > 1000 ? (distanceToNextStop/1000).toFixed(1) + 'km' : Math.round(distanceToNextStop) + 'm')}` };
+		const { type, distance } = maneuver;
+		let icon = "navigate";
+		let text = "";
+
+		let distText = "";
+		if (distance > 1000) {
+			distText = (distance / 1000).toFixed(1) + " km";
+		} else if (distance >= 100) {
+			// Update every 50m
+			distText = Math.round(distance / 50) * 50 + " m";
+		} else {
+			// Update every 20m
+			// Ensure we don't show "0 m" prematurely if they aren't "arrived" yet?
+			// But for "turn now" logic we use < 20 check anyway.
+			distText = Math.round(distance / 20) * 20 + " m";
 		}
-		
-		return { icon: "navigate", text: `Follow route for ${(distanceToNextStop / 1000).toFixed(1)}km` };
+
+		// Normalize type/modifier for better matching
+		const effectiveType =
+			type === "turn" && maneuver.modifier ? `turn_${maneuver.modifier}` : type;
+
+		switch (effectiveType) {
+			case "turn_right":
+			case "right":
+				icon = "arrow-forward";
+				text = `Turn right \nin ${distText}`;
+				break;
+			case "turn_left":
+			case "left":
+				icon = "arrow-back";
+				text = `Turn left \nin ${distText}`;
+				break;
+			case "slight_right":
+				icon = "arrow-forward-circle-outline";
+				text = `Bear right \nin ${distText}`;
+				break;
+			case "slight_left":
+				icon = "arrow-back-circle-outline";
+				text = `Bear left \nin ${distText}`;
+				break;
+			case "u_turn":
+			case "uturn":
+				icon = "refresh";
+				text = `Make a U-turn \nin ${distText}`;
+				break;
+			case "sharp_right":
+				icon = "arrow-forward";
+				text = `Sharp right \nin ${distText}`;
+				break;
+			case "sharp_left":
+				icon = "arrow-back";
+				text = `Sharp left \nin ${distText}`;
+				break;
+			case "arrive":
+				icon = "location";
+				if (distance < 10) {
+					text = "Arrived at \ndestination";
+				} else {
+					text = `Arriving \nin ${distText}`;
+				}
+				break;
+			case "roundabout":
+			case "rotary":
+				icon = "refresh";
+				if (maneuver.exit) {
+					text = `Take exit ${maneuver.exit} \nin ${distText}`;
+				} else {
+					text = `Enter roundabout \nin ${distText}`;
+				}
+				break;
+			default:
+				if (maneuver.modifier) {
+					if (maneuver.modifier.includes("right")) {
+						icon = "arrow-forward";
+						text = `Turn right \nin ${distText}`;
+					} else if (maneuver.modifier.includes("left")) {
+						icon = "arrow-back";
+						text = `Turn left \nin ${distText}`;
+					} else {
+						icon = "navigate";
+						text = `Follow route \nin ${distText}`;
+					}
+				} else {
+					icon = "navigate";
+					text = `Follow route \nin ${distText}`;
+				}
+		}
+
+		if (distance < 20 && type !== "arrive") {
+			text = text.replace(`\nin ${distText}`, "\nnow");
+		}
+
+		return { icon, text };
 	};
 
 	const instruction = getInstruction();

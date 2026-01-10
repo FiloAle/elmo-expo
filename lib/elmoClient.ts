@@ -41,8 +41,10 @@ const systemPromptBase = [
 	"You are Elmo, a helpful and witty voice assistant for a navigation app.",
 	"You have access to the user's location and can control the map.",
 	"Avoid chit-chat and disclaimers; be direct, safe and helpful, but also enthusiast and proactive.",
+	"CRITICAL: Your verbal response MUST be under 200 characters. Be conversational and witty, but brief. Use full sentences, never robotically list keywords.",
 	"NEVER use asterisks or other non-alphanumeric characters (you can use: '.', ','. '!', '?', ':', ''').",
-	"Whenever you are asked something that's not about navigation/exploration/travelling or in-car interaction, answer with 'Sorry, I'm not sure I have the right answer for you.'",
+	"You can answer general knowledge questions, especially about the location, history, and nearby places. Only refuse if the topic is completely unrelated to the trip (e.g. coding, math, politics).",
+	"CRITICAL: If the user asks for 'fun facts', 'trivia', or 'interesting things' about the current location or destination, YOU MUST ANSWER using your general knowledge about that place. Do not refuse these requests.",
 	"IMPORTANT: You must output a JSON object.",
 	"The JSON schema is:",
 	"{",
@@ -74,7 +76,10 @@ const systemPromptBase = [
 	"- Otherwise, set 'navigation' to null.",
 ];
 
-function buildSystemPrompt(location?: LocationInfo): string {
+function buildSystemPrompt(
+	location?: LocationInfo,
+	deviceRole?: string
+): string {
 	const lines = [...systemPromptBase];
 	lines.push(`Current local time: ${new Date().toLocaleTimeString()}`);
 
@@ -98,6 +103,23 @@ function buildSystemPrompt(location?: LocationInfo): string {
 		);
 	}
 
+	if (deviceRole === "car1-rear") {
+		lines.push(
+			"CRITICAL - REAR SEAT MODE:",
+			"You are assisting a PASSENGER in the rear seat. You CANNOT start or cancel navigation.",
+			"If the user asks for a destination/route:",
+			"1. Output the navigation JSON with 'destinationName' and 'coordinates' found.",
+			"2. Set 'startNavigation': false.",
+			"3. In your verbal reply, say you have found the place and mention the distance/time.",
+			"4. NEVER ask 'Should we start?' or offer to start the trip.",
+			"5. You can ask if they want to add it as a STOP, or just inform them."
+		);
+	} else {
+		lines.push(
+			"You are assisting the DRIVER (or main passenger). You can start navigation."
+		);
+	}
+
 	lines.push(
 		"Rules for suggesting stops:",
 		"- CRITICAL: The suggested stop MUST be a city or point of interest that is geographically BETWEEN the starting location and the final destination.",
@@ -115,9 +137,11 @@ function buildSystemPrompt(location?: LocationInfo): string {
 		"- If no destination is set, suggest activities near the current location.",
 		"- Be enthusiastic and specific."
 	);
-	
+
 	if (location?.destination) {
-		lines.push(`CURRENT DESTINATION: ${location.destination.name} (Lat: ${location.destination.latitude}, Lng: ${location.destination.longitude})`);
+		lines.push(
+			`CURRENT DESTINATION: ${location.destination.name} (Lat: ${location.destination.latitude}, Lng: ${location.destination.longitude})`
+		);
 	}
 
 	return lines.join("\n");
@@ -127,12 +151,21 @@ const MAX_HISTORY = 8;
 
 const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY;
 
-export type ChatMsg = { role: "user" | "assistant"; content: string };
+import { PlaceResult } from "./places";
+
+export type ChatMsg = {
+	role: "user" | "assistant";
+	content: string;
+	sender?: string;
+	target?: string;
+	places?: PlaceResult[];
+};
 
 export async function askElmoLLM(
 	userPrompt: string,
 	history: ChatMsg[],
-	location?: LocationInfo
+	location?: LocationInfo,
+	deviceRole?: string
 ): Promise<{
 	reply: string;
 	source: "groq" | "fallback";
@@ -153,7 +186,7 @@ export async function askElmoLLM(
 		)
 		.slice(-MAX_HISTORY);
 
-	const systemPrompt = buildSystemPrompt(location);
+	const systemPrompt = buildSystemPrompt(location, deviceRole);
 
 	const messages: { role: "system" | "user" | "assistant"; content: string }[] =
 		[
@@ -209,46 +242,4 @@ export async function askElmoLLM(
 		console.error("Groq error in Expo client:", err);
 		return { reply: getFallbackReply(userPrompt), source: "fallback" };
 	}
-}
-
-const TTS_MODEL = "playai-tts";
-const TTS_DEFAULT_VOICE = "Basil-PlayAI";
-const TTS_RESPONSE_FORMAT = "wav";
-
-export async function createGroqTtsAudio(
-	text: string,
-	voice: string = TTS_DEFAULT_VOICE
-): Promise<ArrayBuffer> {
-	const trimmed = String(text ?? "").trim();
-	if (!trimmed) {
-		throw new Error("No text provided for TTS");
-	}
-
-	if (!GROQ_API_KEY) {
-		throw new Error("Missing EXPO_PUBLIC_GROQ_API_KEY");
-	}
-
-	const res = await fetch("https://api.groq.com/openai/v1/audio/speech", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${GROQ_API_KEY}`,
-		},
-		body: JSON.stringify({
-			model: TTS_MODEL,
-			voice,
-			input: trimmed,
-			response_format: TTS_RESPONSE_FORMAT,
-			speed: 1.1,
-		}),
-	});
-
-	if (!res.ok) {
-		const errorText = await res.text();
-		console.error("Groq TTS error:", res.status, errorText);
-		throw new Error("Groq TTS request failed");
-	}
-
-	const arrayBuffer = await res.arrayBuffer();
-	return arrayBuffer;
 }

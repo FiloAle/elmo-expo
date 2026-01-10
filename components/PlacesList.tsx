@@ -39,22 +39,19 @@ export function PlacesList({ places, onSelectPlace }: PlacesListProps) {
 						</Text>
 					</TouchableOpacity>
 				))}
-				<TouchableOpacity
-						key="add_button"
-						style={styles.item}
-					>
-						<View style={styles.addContainer}>
-							<Ionicons
-								name={"add-outline"}
-								size={32}
-								color="#ffffff"
-							/>
-						</View>
-						<Text style={styles.name} numberOfLines={1}>
-							Add
-						</Text>
-					</TouchableOpacity>
+				<TouchableOpacity key="add_button" style={styles.item}>
+					<View style={styles.addContainer}>
+						<Ionicons name={"add-outline"} size={32} color="#ffffff" />
+					</View>
+					<Text style={styles.name} numberOfLines={1}>
+						Add
+					</Text>
+				</TouchableOpacity>
 			</View>
+			<TouchableOpacity style={styles.searchBar}>
+				<Ionicons name="search" size={20} color="#9ca3af" />
+				<Text style={styles.searchText}>Search places</Text>
+			</TouchableOpacity>
 		</View>
 	);
 }
@@ -62,7 +59,7 @@ export function PlacesList({ places, onSelectPlace }: PlacesListProps) {
 const styles = StyleSheet.create({
 	container: {
 		flex: 1,
-		paddingVertical: 16,
+		paddingVertical: 24,
 	},
 	header: {
 		fontSize: 18,
@@ -103,5 +100,20 @@ const styles = StyleSheet.create({
 		fontWeight: "medium",
 		color: "#ffffffcc",
 		marginTop: 4,
+	},
+	searchBar: {
+		flexDirection: "row",
+		alignItems: "center",
+		backgroundColor: "#01181C",
+		borderWidth: 1,
+		borderColor: "#112e33",
+		borderRadius: 18,
+		padding: 12,
+		marginTop: 24,
+		gap: 12,
+	},
+	searchText: {
+		color: "#9ca3af",
+		fontSize: 16,
 	},
 });

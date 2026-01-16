@@ -197,7 +197,7 @@ export default function App() {
 		avoidFerries: false,
 		avoidHighways: false,
 	});
-	const [syncServerUrl, setSyncServerUrl] = useState("192.168.1.78");
+	const [syncServerUrl, setSyncServerUrl] = useState("172.20.10.6");
 	const [deviceRole, setDeviceRole] = useState<DeviceRole>("car1-main");
 
 	// Convoy Sync State
@@ -256,6 +256,7 @@ export default function App() {
 
 	// --- Refs ---
 	const mapRef = useRef<MapView>(null);
+	const currentLookaheadHeading = useRef<number>(0);
 	const currentAudioRef = useRef<Audio.Sound | null>(null);
 	const ttsQueue = useRef<
 		{
@@ -703,16 +704,25 @@ export default function App() {
 
 					// 7. Update Camera with proper centering
 					if (mapRef.current && !selectedPlaceRef.current) {
-						mapRef.current.animateCamera(
-							{
-								center: { latitude: newLat, longitude: newLng },
-								heading: bearing,
-								pitch: 60,
-								zoom: 18,
-								altitude: 100, // Required for iOS
-							},
-							{ duration: 100 }
-						); // Smooth update
+						// Smooth Heading Logic
+						let diff = bearing - currentLookaheadHeading.current;
+						// Normalize to -180...180
+						if (diff > 180) diff -= 360;
+						if (diff < -180) diff += 360;
+
+						// Limit step (e.g. 5 degrees per frame)
+						const maxStep = 5;
+						const step = Math.max(-maxStep, Math.min(maxStep, diff));
+						currentLookaheadHeading.current =
+							(currentLookaheadHeading.current + step + 360) % 360;
+
+						mapRef.current.setCamera({
+							center: { latitude: newLat, longitude: newLng },
+							heading: currentLookaheadHeading.current,
+							pitch: 60,
+							zoom: 18,
+							altitude: 100, // Required for iOS
+						});
 					}
 
 					// 9. Estimate speed limit based on current speed (simulating road type)
@@ -1013,6 +1023,8 @@ export default function App() {
 							setAddedStops([]);
 							setMyStopRequests([]);
 							setDeclinedStopRequests([]);
+							distanceTraveled.current = 0;
+							distanceTraveledOnCurrentRoute.current = 0;
 
 							// Reset camera to idle view
 							if (userRegionRef.current) {
@@ -1336,7 +1348,7 @@ export default function App() {
 								heading: cameraHeading,
 								pitch: pitch,
 								altitude: altitude,
-								zoom: Platform.OS === "android" ? 18 : undefined,
+								zoom: 18,
 							},
 							{ duration: 1000 }
 						);
@@ -2428,19 +2440,16 @@ export default function App() {
 		hasTriggeredFakeStopRef.current = false;
 		navigationStartTime.current = Date.now();
 		if (userRegion && mapRef.current) {
-			mapRef.current.animateCamera(
-				{
-					center: {
-						latitude: userRegion.latitude,
-						longitude: userRegion.longitude,
-					},
-					heading: userHeading,
-					pitch: 60,
-					altitude: 100,
-					zoom: 18,
+			mapRef.current.setCamera({
+				center: {
+					latitude: userRegion.latitude,
+					longitude: userRegion.longitude,
 				},
-				{ duration: 1000 }
-			);
+				heading: userHeading,
+				pitch: 60,
+				altitude: 100,
+				zoom: 18,
+			});
 		}
 	}
 
@@ -2495,6 +2504,8 @@ export default function App() {
 		setRouteInfo(null);
 		setNavigationState("idle");
 		setSpeed(0); // Reset speed to 0
+		distanceTraveled.current = 0;
+		distanceTraveledOnCurrentRoute.current = 0;
 		setIsPausedAtStop(false);
 		setShowStopsPanel(false);
 		setMessages((prev) => [
@@ -2508,19 +2519,16 @@ export default function App() {
 
 		// Zoom out to default view
 		if (userRegion) {
-			mapRef.current?.animateCamera(
-				{
-					center: {
-						latitude: userRegion.latitude,
-						longitude: userRegion.longitude,
-					},
-					heading: userHeading,
-					altitude: Platform.OS === "ios" ? 2000 : undefined,
-					zoom: Platform.OS === "android" ? 15 : undefined,
-					pitch: 0,
+			mapRef.current?.setCamera({
+				center: {
+					latitude: userRegion.latitude,
+					longitude: userRegion.longitude,
 				},
-				{ duration: 500 }
-			);
+				heading: userHeading,
+				altitude: 2000,
+				zoom: 15,
+				pitch: 0,
+			});
 		}
 	}
 
@@ -2999,7 +3007,7 @@ export default function App() {
 							)}
 							{routeWaypoints.map((wp, index) => (
 								<Marker
-									key={`${wp.name}-${wp.latitude}-${wp.longitude}`}
+									key={`${wp.name}-${wp.latitude}-${wp.longitude}-${index}`}
 									coordinate={{
 										latitude: wp.latitude,
 										longitude: wp.longitude,
@@ -3012,6 +3020,8 @@ export default function App() {
 								coordinates={routeCoords}
 								strokeWidth={navigationState === "active" ? 14 : 6}
 								strokeColor="#14b8a6"
+								lineJoin="round"
+								lineCap="round"
 							/>
 							{/* Selected Place Marker (Rear Idle) */}
 							{selectedPlace && deviceRole === "car1-rear" && (

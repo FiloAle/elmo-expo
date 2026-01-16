@@ -209,6 +209,7 @@ function handleMessage(ws, msg) {
 		// Update convoy state if it's a convoy property
 		if (msg.type === "destination") convoyState.destination = msg.data;
 		if (msg.type === "waypoints") convoyState.waypoints = msg.data;
+		if (msg.type === "route") convoyState.routeInfo = msg.data; // Store route data
 		if (msg.type === "navigation_state")
 			convoyState.navigationState = msg.data.state;
 
@@ -264,7 +265,7 @@ app.get("/health", (req, res) => {
 		status: "running",
 		clients: clients.size,
 		convoy: convoyState,
-		cars: Object.keys(carStates),
+		cars: carStates,
 	});
 });
 

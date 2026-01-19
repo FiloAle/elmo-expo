@@ -23,7 +23,7 @@ This repository contains the source code for the vehicle's main interface. It ha
 1. Clone the repository.
 2. Install dependencies: `npm install`.
 3. Ensure the Node.js server is running.
-4. Configure the `.env` file with API keys (Groq & OSM).
+4. Configure the `.env` file with API keys (Groq & OpenWeather as `EXPO_PUBLIC_GROQ_API_KEY` and `EXPO_PUBLIC_OPENWEATHER_API_KEY`).
 5. Start the prototype: `npx expo start` (run on iPad Simulator or physical device).
 
 ---

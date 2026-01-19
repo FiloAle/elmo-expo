@@ -1,50 +1,30 @@
-# Welcome to your Expo app 👋
+# Elmo - In-Car Navigation System 🚙💨
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+The in-car software component of the **Elmo** ecosystem, prototyped for iPad to simulate the vehicle's embedded infotainment system (Front & Rear screens).
 
-## Get started
+## 📖 Overview
+This repository contains the source code for the vehicle's main interface. It handles navigation visualization, instrument cluster data, and synchronizes real-time state with passenger devices.
 
-1. Install dependencies
+## ✨ Key Features
+* **Dual-Role Interface:** Supports two operation modes:
+    * **Front Display:** Driver-focused dashboard with speed, navigation instructions, and stop management.
+    * **Rear Display:** Passenger view with route progress, ETA, and collaborative suggestions.
+* **Ambient Light Control:** Signals directional cues to the connected Arduino-controlled LED strip.
+* **Ecosystem Sync:** Acts as the central hub, synchronizing trip data and stop requests with the mobile companion app.
+* **Intelligent Routing:** Integrated OpenStreetMap for real-time mapping and POI discovery.
+* **Voice Assistant:** Hands-free interaction powered by Llama (via Groq API).
 
-   ```bash
-   npm install
-   ```
+## 🛠️ Tech Stack
+* **Framework:** React Native (Expo).
+* **Backend & Sync:** Node.js local server for device orchestration.
+* **AI & Maps:** Llama LLM (Groq) & OpenStreetMap API.
 
-2. Start the app
+## 🚀 Getting Started
+1. Clone the repository.
+2. Install dependencies: `npm install`.
+3. Ensure the Node.js server is running.
+4. Configure the `.env` file with API keys (Groq & OSM).
+5. Start the prototype: `npx expo start` (run on iPad Simulator or physical device).
 
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
-```
-
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+---
+*Developed for the "Mobility Futures" exhibition at Politecnico di Milano (2026).*

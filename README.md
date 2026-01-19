@@ -18,7 +18,7 @@ This repository contains the source code for the vehicle's main interface. It ha
 * **Framework:** React Native (Expo).
 * **Backend & Sync:** Node.js local server for device orchestration.
 * **AI & Maps:** Llama LLM (Groq) & OpenStreetMap API.
-* * **Weather:** OpenWeather API.
+* **Weather:** OpenWeather API.
 
 ## 🚀 Getting Started
 1. Clone the repository.
